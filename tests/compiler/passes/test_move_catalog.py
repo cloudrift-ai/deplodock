@@ -11,18 +11,18 @@ file pins the catalog's **legal product** two ways:
 
 from __future__ import annotations
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.ir.schedule import TilePlan
-from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
-from deplodock.compiler.pipeline.fork import flatten_leaves
-from deplodock.compiler.pipeline.knob import axis_of, family_of, family_value
-from deplodock.compiler.pipeline.pipeline import Run
-from deplodock.compiler.pipeline.search.space import MAX_BLOCK_THREADS as _MAX_BLOCK_THREADS
-from deplodock.compiler.pipeline.search.space import scalar_tile_moves
+from emmy.compiler.context import Context
+from emmy.compiler.dim import Dim
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.frontend.ir import MatmulOp
+from emmy.compiler.ir.schedule import TilePlan
+from emmy.compiler.pipeline import TILE_PASSES, Pipeline
+from emmy.compiler.pipeline.fork import flatten_leaves
+from emmy.compiler.pipeline.knob import axis_of, family_of, family_value
+from emmy.compiler.pipeline.pipeline import Run
+from emmy.compiler.pipeline.search.space import MAX_BLOCK_THREADS as _MAX_BLOCK_THREADS
+from emmy.compiler.pipeline.search.space import scalar_tile_moves
 
 # The hand-computed legal product as explicit literals — per-cell option-0, then the (par × reg) grid
 # spelled through the codec (the default ``f1x1`` register sub-tile suppresses, so ``reg=(1,1)`` is the
@@ -68,7 +68,7 @@ def test_schedule_leaf_set_equals_catalog():
     - every tiled tile rides serial × {gmem-direct + the resolved d1 stages} + the divisor-guarded
       split-K widths on the gmem-direct row only (split partials are gmem-direct).
     """
-    from deplodock.compiler.pipeline.search.space import coop_reduce_moves, splitk_moves
+    from emmy.compiler.pipeline.search.space import coop_reduce_moves, splitk_moves
 
     rows: list[dict] = []
 

@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from deplodock.serving.sampling import Sampler, apply_chat_template, greedy
+from emmy.serving.sampling import Sampler, apply_chat_template, greedy
 
 
 def test_greedy_picks_argmax():

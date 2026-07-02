@@ -1,6 +1,6 @@
 """Tests for BenchmarkTask.compute_code_hash() determinism."""
 
-from deplodock.planner import BenchmarkTask
+from emmy.planner import BenchmarkTask
 
 
 def test_code_hash_deterministic():

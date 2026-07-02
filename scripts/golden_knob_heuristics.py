@@ -46,10 +46,10 @@ import math
 
 import numpy as np
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.pipeline.search import features
-from deplodock.compiler.pipeline.search.analytic import _enumerate
-from deplodock.compiler.pipeline.search.golden import (
+from emmy.compiler.context import Context
+from emmy.compiler.pipeline.search import features
+from emmy.compiler.pipeline.search.analytic import _enumerate
+from emmy.compiler.pipeline.search.golden import (
     GOLDEN_CONFIGS,
     MatmulGoldenConfig,
     PointwiseGoldenConfig,
@@ -79,13 +79,13 @@ def _dag_from_snippet(snippet: str, ctx: Context):
     ``analytic._matmul_dag`` but regime-agnostic: ``torch.sum`` / ``torch.relu`` have
     no dedicated frontend op, so the dag comes from the real trace, not a hand-built
     graph. Returns ``None`` if nothing lowers."""
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag  # noqa: PLC0415
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag  # noqa: PLC0415
 
-    from deplodock.commands.trace import graph_from_code  # noqa: PLC0415
-    from deplodock.compiler.ir.loop import LoopOp  # noqa: PLC0415
-    from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline  # noqa: PLC0415
-    from deplodock.compiler.pipeline.fork import Fork  # noqa: PLC0415
-    from deplodock.compiler.pipeline.pipeline import Run  # noqa: PLC0415
+    from emmy.commands.trace import graph_from_code  # noqa: PLC0415
+    from emmy.compiler.ir.loop import LoopOp  # noqa: PLC0415
+    from emmy.compiler.pipeline import LOOP_PASSES, Pipeline  # noqa: PLC0415
+    from emmy.compiler.pipeline.fork import Fork  # noqa: PLC0415
+    from emmy.compiler.pipeline.pipeline import Run  # noqa: PLC0415
 
     def _option0(fp):
         o = fp.options[0]
@@ -107,7 +107,7 @@ def _reduce_rows(dag) -> list[dict]:
     ``REDUCE@<axis>``); a 1-D reduce (no outer M axis) leaves the M slot degenerate,
     which the schema-agnostic ``tile_signature`` matches against the golden's
     ``BM``/``FM`` = 1."""
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _moves  # noqa: PLC0415
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _moves  # noqa: PLC0415
 
     budget = _moves.Budget()
     thread = _moves.coop_free_threads(dag)  # free-axis THREAD tile (par)
@@ -125,7 +125,7 @@ def _pointwise_rows(dag) -> list[dict]:
     rows carry only the free-axis tile (no ``REDUCE@`` — a MAP nest has no contraction);
     ``tile_signature``'s degenerate reduce decomposition matches the golden's
     ``BK=FK=SPLITK=BR=1``."""
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _moves  # noqa: PLC0415
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _moves  # noqa: PLC0415
 
     budget = _moves.Budget()
     rows = []
@@ -308,7 +308,7 @@ def main() -> None:
     # only improve on the live ranking (the dyn fit seeds from the STATIC result
     # — the masked tier shares most of the geometry priors and diverges where the
     # boundary guard / occupancy differences demand).
-    from deplodock.compiler.pipeline.search.prior.analytic import _W_A  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.prior.analytic import _W_A  # noqa: PLC0415
 
     seed_raw = np.array([_W_A.get(n, 0.0) for n in names])
 

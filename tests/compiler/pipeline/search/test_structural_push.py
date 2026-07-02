@@ -16,16 +16,16 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler import dtype as _dt
-from deplodock.compiler import target as target_mod
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
-from deplodock.compiler.pipeline import TILE_PASSES, Pipeline, TuningSearch
-from deplodock.compiler.pipeline.fork import Fork, OptionFork
-from deplodock.compiler.pipeline.pipeline import _is_structural_option
-from deplodock.compiler.pipeline.search.db import SearchDB
+from emmy.compiler import dtype as _dt
+from emmy.compiler import target as target_mod
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
+from emmy.compiler.pipeline import TILE_PASSES, Pipeline, TuningSearch
+from emmy.compiler.pipeline.fork import Fork, OptionFork
+from emmy.compiler.pipeline.pipeline import _is_structural_option
+from emmy.compiler.pipeline.search.db import SearchDB
 from tests.compiler.conftest import drain_tune
 
 
@@ -45,7 +45,7 @@ _S, _H, _I = 32, 1024, 3072
 def _isolated_prior(monkeypatch, tmp_path):
     """Untrained prior so descents are deterministic regardless of the host's
     checkpoint; target reset after each test."""
-    monkeypatch.setenv("DEPLODOCK_PRIOR_FILE", str(tmp_path / "prior.json"))
+    monkeypatch.setenv("EMMY_PRIOR_FILE", str(tmp_path / "prior.json"))
     yield
     target_mod.set_target(None)
 

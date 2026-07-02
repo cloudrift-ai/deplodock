@@ -1,7 +1,7 @@
 """Unit tests for engine flag mapping and CLI argument building."""
 
-from deplodock.recipe import LLMConfig, SglangConfig, VllmConfig, build_engine_args
-from deplodock.recipe.engines import (
+from emmy.recipe import LLMConfig, SglangConfig, VllmConfig, build_engine_args
+from emmy.recipe.engines import (
     _HARDCODED_FLAGS,
     SGLANG_FLAG_MAP,
     VLLM_FLAG_MAP,

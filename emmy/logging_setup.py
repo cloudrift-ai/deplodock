@@ -1,0 +1,21 @@
+"""CLI logging setup: simple %(message)s format for standalone commands."""
+
+import logging
+import sys
+
+from emmy.redact import install_redaction
+
+
+def setup_cli_logging():
+    """Configure root logger with plain message format for CLI commands.
+
+    Produces output identical to print(). The bench command's setup_logging()
+    overrides this with a prefixed format.
+    """
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    install_redaction(handler)
+    root.addHandler(handler)

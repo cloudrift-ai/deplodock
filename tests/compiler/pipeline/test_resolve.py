@@ -13,22 +13,22 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler import target as target_mod
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
-from deplodock.compiler.pipeline.fork import Fork
-from deplodock.compiler.pipeline.pipeline import Run
+from emmy.compiler import target as target_mod
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.frontend.ir import MatmulOp
+from emmy.compiler.ir.loop import LoopOp
+from emmy.compiler.pipeline import TILE_PASSES, Pipeline
+from emmy.compiler.pipeline.fork import Fork
+from emmy.compiler.pipeline.pipeline import Run
 
 
 @pytest.fixture(autouse=True)
 def _isolated_prior(monkeypatch, tmp_path):
     """Untrained prior file so any lazy prior load is deterministic; target
     reset after each test."""
-    monkeypatch.setenv("DEPLODOCK_PRIOR_FILE", str(tmp_path / "prior.json"))
+    monkeypatch.setenv("EMMY_PRIOR_FILE", str(tmp_path / "prior.json"))
     yield
     target_mod.set_target(None)
 
@@ -81,7 +81,7 @@ def test_option0_decide_matches_no_prior_greedy() -> None:
     """A decide that always takes option-0 reproduces the no-prior greedy
     compile (``greedy_decide(prior=None)`` falls to emission order at every
     fork — the same first leaf)."""
-    from deplodock.compiler.pipeline.search.policy import greedy_decide
+    from emmy.compiler.pipeline.search.policy import greedy_decide
 
     ctx = Context.from_target((8, 0))
     greedy, _ = Run(pipeline=Pipeline.build(TILE_PASSES), ctx=ctx).resolve(_f32_matmul_graph(), greedy_decide(prior=None))
@@ -100,7 +100,7 @@ def test_trace_records_partition_fork() -> None:
     the kernel's node id, ``chosen_kind == "op"`` (a ``TileOp`` rebind), the decide's score
     annotation (``None`` for the unranked option-0 decide), and the chosen leaf's COMPLETE knob
     row (the axis-named ``TILE@<k>`` key; option-0 = the conservative per-cell leaf)."""
-    from deplodock.compiler.pipeline.knob import family_of, family_value
+    from emmy.compiler.pipeline.knob import family_of, family_value
 
     g = _f32_matmul_graph()
     run = Run(pipeline=Pipeline.build(TILE_PASSES), ctx=Context.from_target((8, 0)))

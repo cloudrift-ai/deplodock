@@ -5,7 +5,7 @@ column contains a card per ``(Stage, body-Load)`` pair showing the warp's
 per-lane smem bank at one inner-loop iteration.
 
 Simulation:
-:func:`deplodock.compiler.diagnostics.bank_conflicts.simulate_graph`
+:func:`emmy.compiler.diagnostics.bank_conflicts.simulate_graph`
 compiles the kernel, instruments it at the kernel-lowering stage, and runs one CTA
 to record actual smem addresses per lane. This script is a thin CLI +
 ECharts emitter. **Requires CUDA** — compile and launch must succeed.
@@ -13,9 +13,9 @@ ECharts emitter. **Requires CUDA** — compile and launch must succeed.
 Workflow — produce IRs via the compiler with whatever pass gates you
 want, then feed the dumped JSONs in::
 
-    DEPLODOCK_DUMP_DIR=/tmp/dump_a deplodock compile MODEL --layer 0
-    DEPLODOCK_DISABLE_CHUNK_REDUCE=1 \\
-        DEPLODOCK_DUMP_DIR=/tmp/dump_b deplodock compile MODEL --layer 0
+    EMMY_DUMP_DIR=/tmp/dump_a emmy compile MODEL --layer 0
+    EMMY_DISABLE_CHUNK_REDUCE=1 \\
+        EMMY_DUMP_DIR=/tmp/dump_b emmy compile MODEL --layer 0
     python scripts/visualize_bank_conflicts.py \\
         -i /tmp/dump_a/14_lowering_tile.json:baseline \\
         -i /tmp/dump_b/14_lowering_tile.json:no_chunk_reduce \\
@@ -31,9 +31,9 @@ import argparse
 import json
 import os
 
-from deplodock.compiler.diagnostics.bank_conflicts import BankConflictResult, simulate_graph
-from deplodock.compiler.graph import Graph
-from deplodock.visualize.page import render_html
+from emmy.compiler.diagnostics.bank_conflicts import BankConflictResult, simulate_graph
+from emmy.compiler.graph import Graph
+from emmy.visualize.page import render_html
 
 
 def graph_from_ir_path(path: str) -> Graph:
@@ -220,7 +220,7 @@ BODY_HTML = """
 
 # PALETTE_1 — used for the smem-layout ladder ("color = bank id").
 # PALETTE_2 — used for the lane×bank punch card ("color = address index").
-# Both are 32-color qualitative palettes from deplodock.visualize.theme;
+# Both are 32-color qualitative palettes from emmy.visualize.theme;
 # kept visually disjoint so a reader never confuses one plot for the other.
 SCRIPTS_JS = r"""
 const WARP=32, BANKS=32;
@@ -588,7 +588,7 @@ def main() -> None:
     print(f"saved {args.out}")
 
     for image_path in args.image:
-        from deplodock.visualize.image import render as render_image
+        from emmy.visualize.image import render as render_image
 
         render_image(html, image_path, transparent=args.transparent)
         print(f"saved {image_path}")

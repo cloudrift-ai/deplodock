@@ -1,6 +1,6 @@
 """Tests for best-effort engine-load-phase parsing from container logs."""
 
-from deplodock.deploy.log_phases import decompose_model_load, parse_engine_load_phases
+from emmy.deploy.log_phases import decompose_model_load, parse_engine_load_phases
 
 # Real vLLM 0.20.1 startup log lines (captured from a live CloudRift pro6000 deploy of
 # Qwen3.6-35B-A3B-FP8). The CUDA-graph tqdm bars are concatenated onto one line, as

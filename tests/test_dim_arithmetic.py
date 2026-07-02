@@ -11,8 +11,8 @@ Covers:
 
 from __future__ import annotations
 
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
+from emmy.compiler.dim import Dim
+from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
 
 
 def test_static_static_arithmetic_folds():

@@ -1,6 +1,6 @@
-"""CLI tests for ``deplodock run`` — accuracy check + ``--bench`` table.
+"""CLI tests for ``emmy run`` — accuracy check + ``--bench`` table.
 
-Accuracy failures (``max_diff >= 1.0``) make ``deplodock run`` exit
+Accuracy failures (``max_diff >= 1.0``) make ``emmy run`` exit
 non-zero, so ``rc == 0`` is the accuracy assertion.
 """
 
@@ -50,30 +50,30 @@ def test_run_input_and_code_mutually_exclusive(run_cli):
 
 
 def test_pinned_knobs_sets_and_restores_env(monkeypatch):
-    """``_pinned_knobs`` pins ``DEPLODOCK_<KNOB>`` for the block, then restores the
+    """``_pinned_knobs`` pins ``EMMY_<KNOB>`` for the block, then restores the
     prior environment — removing keys that were unset, restoring preexisting ones
     (the golden-bench A/B relies on this to compile a pinned variant cleanly)."""
     import os
 
-    from deplodock.commands.run import _pinned_knobs
+    from emmy.commands.run import _pinned_knobs
 
-    monkeypatch.delenv("DEPLODOCK_TILE", raising=False)
-    monkeypatch.setenv("DEPLODOCK_STAGE", "preexisting")
+    monkeypatch.delenv("EMMY_TILE", raising=False)
+    monkeypatch.setenv("EMMY_STAGE", "preexisting")
     with _pinned_knobs({"TILE": "n32x8/f2x4", "STAGE": "d2/cp", "WARP_SPECIALIZE": False}):
-        assert os.environ["DEPLODOCK_TILE"] == "n32x8/f2x4"
-        assert os.environ["DEPLODOCK_STAGE"] == "d2/cp"
-        assert os.environ["DEPLODOCK_WARP_SPECIALIZE"] == "False"
-    assert "DEPLODOCK_TILE" not in os.environ  # was unset → removed
-    assert os.environ["DEPLODOCK_STAGE"] == "preexisting"  # restored
-    assert "DEPLODOCK_WARP_SPECIALIZE" not in os.environ
+        assert os.environ["EMMY_TILE"] == "n32x8/f2x4"
+        assert os.environ["EMMY_STAGE"] == "d2/cp"
+        assert os.environ["EMMY_WARP_SPECIALIZE"] == "False"
+    assert "EMMY_TILE" not in os.environ  # was unset → removed
+    assert os.environ["EMMY_STAGE"] == "preexisting"  # restored
+    assert "EMMY_WARP_SPECIALIZE" not in os.environ
 
 
 def _symbolic_input_graph():
     """Frontend-ish graph with one symbolic input (``x``, seq axis 1) and one
     static input (``w``) — enough for ``_hint_sized_inputs``' input pairing."""
-    from deplodock.compiler.dim import Dim
-    from deplodock.compiler.graph import Graph, Tensor
-    from deplodock.compiler.ir.base import InputOp
+    from emmy.compiler.dim import Dim
+    from emmy.compiler.graph import Graph, Tensor
+    from emmy.compiler.ir.base import InputOp
 
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (1, Dim("seq_len"), 8)), node_id="x")
@@ -86,9 +86,9 @@ def _symbolic_input_graph():
 def test_hint_sized_inputs_tiles_symbolic_axes():
     """A symbolic input axis grows to its Dim hint (DEFAULT_SEQ_HINT) by tiling
     the trace-time values; static inputs pass through untouched (the full-model table
-    must bench torch at the same hint shape deplodock benches at)."""
-    from deplodock.commands.run import _hint_sized_inputs
-    from deplodock.compiler.dim import DEFAULT_SEQ_HINT
+    must bench torch at the same hint shape emmy benches at)."""
+    from emmy.commands.run import _hint_sized_inputs
+    from emmy.compiler.dim import DEFAULT_SEQ_HINT
 
     x = torch.randn(1, 32, 8)
     w = torch.randn(4, 8)
@@ -104,7 +104,7 @@ def test_hint_sized_inputs_tiles_symbolic_axes():
 
 
 def test_hint_sized_inputs_static_graph_is_noop():
-    from deplodock.commands.run import _hint_sized_inputs
+    from emmy.commands.run import _hint_sized_inputs
 
     from ..conftest import matmul_graph
 
@@ -117,10 +117,10 @@ def test_hint_sized_inputs_static_graph_is_noop():
 def test_hint_sized_inputs_resizes_kwargs_in_nested_structure():
     """Tensors inside kwargs containers (HF's ``position_embeddings`` tuple
     style) are paired in ``_flatten_tensors`` order and rebuilt in place."""
-    from deplodock.commands.run import _hint_sized_inputs
-    from deplodock.compiler.dim import Dim
-    from deplodock.compiler.graph import Graph, Tensor
-    from deplodock.compiler.ir.base import InputOp
+    from emmy.commands.run import _hint_sized_inputs
+    from emmy.compiler.dim import Dim
+    from emmy.compiler.graph import Graph, Tensor
+    from emmy.compiler.ir.base import InputOp
 
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (1, Dim("seq_len"), 8)), node_id="x")
@@ -139,7 +139,7 @@ def test_hint_sized_inputs_resizes_kwargs_in_nested_structure():
 
 
 def test_tile_to_non_divisible_and_dtype():
-    from deplodock.commands.run import _tile_to
+    from emmy.commands.run import _tile_to
 
     t = torch.tensor([[1, 2]], dtype=torch.long)
     out = _tile_to(t, 1, 5)
@@ -149,7 +149,7 @@ def test_tile_to_non_divisible_and_dtype():
 
 
 def test_symbolic_bench_note():
-    from deplodock.commands.run import _symbolic_bench_note
+    from emmy.commands.run import _symbolic_bench_note
 
     assert _symbolic_bench_note({}) is None
     note = _symbolic_bench_note({"seq_len": 512})
@@ -163,7 +163,7 @@ def test_build_torch_fns_resets_dynamo_before_compile(monkeypatch):
     tcompile column. ``_build_torch_fns`` must reset dynamo before each compile."""
     import torch._dynamo
 
-    from deplodock.commands.run import _build_torch_fns
+    from emmy.commands.run import _build_torch_fns
 
     calls: list[bool] = []
     real_reset = torch._dynamo.reset
@@ -209,10 +209,10 @@ def test_run_ab_rejects_malformed_spec(run_cli):
 
 
 def test_ab_samples_parse_label_and_shape():
-    """``_ab_samples`` parses each spec with the ``DEPLODOCK_KNOBS`` grammar, labels
+    """``_ab_samples`` parses each spec with the ``EMMY_KNOBS`` grammar, labels
     the row with the raw spec, and marks it shapeless (the ``_print_kernel_stats``
     cue to nest by kernel ``S_*`` signature instead of a golden matmul shape)."""
-    from deplodock.commands.run import _ab_samples
+    from emmy.commands.run import _ab_samples
 
     (s,) = _ab_samples(["tile=n16x8, STAGE=d2/cp"])
     assert s.knobs == {"TILE": "n16x8", "STAGE": "d2/cp"}  # names uppercased, whitespace tolerated
@@ -232,8 +232,8 @@ def test_bench_golden_variants_retraces_with_dynamic_spec(monkeypatch):
     with ``dynamic_shapes=None``."""
     from types import SimpleNamespace
 
-    from deplodock.commands import trace as tmod
-    from deplodock.commands.run import _bench_golden_variants
+    from emmy.commands import trace as tmod
+    from emmy.commands.run import _bench_golden_variants
 
     seen = []
 
@@ -274,7 +274,7 @@ def test_parse_ncu_csv_keeps_both_sides_and_aggregates():
     """The parser keeps the reference (cuBLAS / aten) rows beside the ``k_*`` rows
     (the comparison table needs both) and aggregates multi-launch rows: ``.sum`` /
     ``smsp__*`` counters add up, percentages average."""
-    from deplodock.commands.run import _ncu_units, _parse_ncu_csv
+    from emmy.commands.run import _ncu_units, _parse_ncu_csv
 
     parsed = _parse_ncu_csv(_NCU_CSV)
     assert set(parsed) == {"k_matmul_abc123", "ampere_sgemm_128x64_nn"}
@@ -286,9 +286,9 @@ def test_parse_ncu_csv_keeps_both_sides_and_aggregates():
 
 
 def test_print_ncu_compare_renders_dep_then_ref(capsys):
-    """The compare table puts deplodock rows above the reference rows, carries the
+    """The compare table puts emmy rows above the reference rows, carries the
     duration unit in the header, and dashes out metrics a side didn't report."""
-    from deplodock.commands.run import _ncu_units, _parse_ncu_csv, _print_ncu_compare
+    from emmy.commands.run import _ncu_units, _parse_ncu_csv, _print_ncu_compare
 
     _print_ncu_compare(_parse_ncu_csv(_NCU_CSV), _ncu_units(_NCU_CSV))
     out = capsys.readouterr().out
@@ -369,9 +369,9 @@ def test_run_code_rmsnorm_fk_accuracy(run_cli, monkeypatch, fk, br):
     a cross-accumulator fold. Pin FK
     (and optionally BR=1 for the pure-serial scope) and confirm the folded
     reduction still matches eager — ``rc == 0`` is the accuracy assertion."""
-    monkeypatch.setenv("DEPLODOCK_FK", str(fk))
+    monkeypatch.setenv("EMMY_FK", str(fk))
     if br is not None:
-        monkeypatch.setenv("DEPLODOCK_BR", str(br))
+        monkeypatch.setenv("EMMY_BR", str(br))
     rc, _, stderr = run_cli("run", "--code", "torch.nn.RMSNorm(2048)(torch.randn(4,32,2048))")
     assert rc == 0, f"stderr: {stderr}"
 
@@ -382,8 +382,8 @@ def test_run_code_fp16_matmul_window_accuracy(run_cli, monkeypatch, fk):
     """fp16 scalar matmul half2 accumulation window:
     pin MMA off + an even FK window and confirm the windowed half2 accumulate +
     fp32 flush matches eager within fp16 tolerance — ``rc == 0`` asserts it."""
-    monkeypatch.setenv("DEPLODOCK_MMA", "0")
-    monkeypatch.setenv("DEPLODOCK_FK", str(fk))
+    monkeypatch.setenv("EMMY_MMA", "0")
+    monkeypatch.setenv("EMMY_FK", str(fk))
     rc, _, stderr = run_cli("run", "--code", "torch.randn(256,256,dtype=torch.float16) @ torch.randn(256,256,dtype=torch.float16)")
     assert rc == 0, f"stderr: {stderr}"
 
@@ -394,9 +394,9 @@ def test_run_code_softmax_fk_accuracy(run_cli, monkeypatch, br):
     """Softmax carries both a ``max`` and a ``sum`` reduce, so FK exercises the
     ``fmaxf`` and ``+`` cross-accumulator folds together. ``rc == 0`` asserts
     the pinned-FK kernel matches eager."""
-    monkeypatch.setenv("DEPLODOCK_FK", "4")
+    monkeypatch.setenv("EMMY_FK", "4")
     if br is not None:
-        monkeypatch.setenv("DEPLODOCK_BR", str(br))
+        monkeypatch.setenv("EMMY_BR", str(br))
     rc, _, stderr = run_cli("run", "--code", "torch.softmax(torch.randn(4,32,2048), dim=-1)")
     assert rc == 0, f"stderr: {stderr}"
 
@@ -486,7 +486,7 @@ def test_run_bench_prints_table(run_cli):
     assert rc == 0, f"stderr: {stderr}"
     log = stdout + stderr
     assert "Eager PyTorch" in log
-    assert "Deplodock" in log
+    assert "Emmy" in log
     assert "vs Eager" in log
 
 
@@ -494,11 +494,11 @@ def test_run_bench_prints_table(run_cli):
 
 
 def _dump_ir(project_root: Path, code: str, stage: str, out_dir: Path) -> Path:
-    """Run ``deplodock compile --code <code> --dump-dir`` and return the path
+    """Run ``emmy compile --code <code> --dump-dir`` and return the path
     to the JSON dump for the requested stage."""
     out_dir.mkdir(parents=True, exist_ok=True)
     rc = subprocess.run(
-        [sys.executable, "-m", "deplodock.deplodock", "compile", "--code", code, "--dump-dir", str(out_dir), "--ir", stage],
+        [sys.executable, "-m", "emmy.emmy", "compile", "--code", code, "--dump-dir", str(out_dir), "--ir", stage],
         capture_output=True,
         text=True,
         cwd=project_root,
@@ -513,7 +513,7 @@ def _dump_ir(project_root: Path, code: str, stage: str, out_dir: Path) -> Path:
 
 @requires_cuda
 def test_run_ir_loop_stage(run_cli, project_root, tmp_path):
-    """``deplodock run --ir <loop.json>`` loads loop IR and runs the
+    """``emmy run --ir <loop.json>`` loads loop IR and runs the
     remaining tile / kernel / cuda passes, executes with random inputs."""
     ir_path = _dump_ir(project_root, "torch.nn.RMSNorm(64)(torch.randn(1,8,64))", "loop", tmp_path)
     rc, stdout, stderr = run_cli("run", "-v", "--ir", str(ir_path))
@@ -569,13 +569,13 @@ def test_run_ir_cuda_stage_no_tail(run_cli, project_root, tmp_path):
 
 @requires_cuda
 def test_run_ir_bench(run_cli, project_root, tmp_path):
-    """``--bench`` with ``--ir`` prints just the deplodock latency row
+    """``--bench`` with ``--ir`` prints just the emmy latency row
     (no eager reference is available for partial-IR mode)."""
     ir_path = _dump_ir(project_root, "torch.nn.RMSNorm(64)(torch.randn(1,8,64))", "tile", tmp_path)
     rc, stdout, stderr = run_cli("run", "--ir", str(ir_path), "--bench", "--warmup", "2", "--iters", "5")
     assert rc == 0, f"stderr: {stderr}"
     log = stdout + stderr
-    assert "Deplodock" in log
+    assert "Emmy" in log
     assert "Latency (us)" in log
 
 
@@ -635,10 +635,10 @@ def test_bind_inputs_preserves_int_dtype():
     of int64 indices would silently corrupt the embedding-lookup path."""
     import numpy as np
 
-    from deplodock.commands.run import _bind_inputs
-    from deplodock.compiler import dtype as dt
-    from deplodock.compiler.graph import Graph, Tensor
-    from deplodock.compiler.ir.base import InputOp
+    from emmy.commands.run import _bind_inputs
+    from emmy.compiler import dtype as dt
+    from emmy.compiler.graph import Graph, Tensor
+    from emmy.compiler.ir.base import InputOp
 
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("input_ids", (1, 8), dt.I64), node_id="input_ids")

@@ -2,8 +2,8 @@
 
 import yaml
 
-from deplodock.deploy import generate_compose, generate_nginx_conf
-from deplodock.recipe import Recipe
+from emmy.deploy import generate_compose, generate_nginx_conf
+from emmy.recipe import Recipe
 
 # ── generate_compose ────────────────────────────────────────────────
 

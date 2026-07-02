@@ -11,15 +11,15 @@ from __future__ import annotations
 
 import importlib
 
-from deplodock.compiler import provenance as prov
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.frontend.ir import RmsNormOp
-from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
-from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
+from emmy.compiler import provenance as prov
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.frontend.ir import RmsNormOp
+from emmy.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
+from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
 
-_STAMP_MODULE = importlib.import_module("deplodock.compiler.pipeline.passes.loop.stamp.010_stamp_loop_names")
+_STAMP_MODULE = importlib.import_module("emmy.compiler.pipeline.passes.loop.stamp.010_stamp_loop_names")
 
 
 def _pointwise_loop() -> LoopOp:
@@ -71,9 +71,9 @@ def test_single_kernel_linear_has_no_qualifier_under_sm90_fold():
     partial coverage and kept the qualifier."""
     import re
 
-    from deplodock.compiler import target as target_mod
-    from deplodock.compiler.ir.base import ConstantOp
-    from deplodock.compiler.ir.frontend.ir import LinearOp
+    from emmy.compiler import target as target_mod
+    from emmy.compiler.ir.base import ConstantOp
+    from emmy.compiler.ir.frontend.ir import LinearOp
 
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (8, 16)), node_id="x")
@@ -122,7 +122,7 @@ def test_stamp_rule_is_idempotent():
     # Second pass over the now-named LoopOp must skip (RuleSkipped). The
     # rewrite engine catches RuleSkipped, so importing it here keeps the
     # assertion explicit about which exit the rule takes.
-    from deplodock.compiler.pipeline import RuleSkipped
+    from emmy.compiler.pipeline import RuleSkipped
 
     g.nodes["o"].op = stamped
     try:

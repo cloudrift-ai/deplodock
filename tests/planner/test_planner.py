@@ -2,11 +2,11 @@
 
 from pathlib import Path
 
-from deplodock.planner import BenchmarkTask, ExecutionGroup
-from deplodock.planner.group_by_model_and_gpu import GroupByModelAndGpuPlanner
-from deplodock.planner.variant import Variant
-from deplodock.recipe import ModelConfig, Recipe
-from deplodock.recipe.types import CommandConfig, DeployConfig
+from emmy.planner import BenchmarkTask, ExecutionGroup
+from emmy.planner.group_by_model_and_gpu import GroupByModelAndGpuPlanner
+from emmy.planner.variant import Variant
+from emmy.recipe import ModelConfig, Recipe
+from emmy.recipe.types import CommandConfig, DeployConfig
 
 
 def _make_task(model="org/model-a", gpu="NVIDIA GeForce RTX 5090", gpu_count=1, recipe_dir="/r", variant=None):

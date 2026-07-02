@@ -9,10 +9,10 @@ the tile dialect (no planner / launch-geometry fallback needed).
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
+from emmy.compiler.pipeline import TILE_PASSES, Pipeline
 
 
 def _input(g: Graph, name: str, shape: tuple) -> str:

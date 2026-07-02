@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-import deplodock.compiler.pipeline.knob as knob_mod
-from deplodock.compiler.pipeline.knob import (
+import emmy.compiler.pipeline.knob as knob_mod
+from emmy.compiler.pipeline.knob import (
     Knob,
     KnobType,
     apply_knobs_env,
@@ -17,7 +17,7 @@ from deplodock.compiler.pipeline.knob import (
     resolve_axis,
     tuning_knob_items,
 )
-from deplodock.compiler.pipeline.search.features import is_warp, knob_features, mma_atom, tile_signature
+from emmy.compiler.pipeline.search.features import is_warp, knob_features, mma_atom, tile_signature
 
 
 def test_int_parse():
@@ -98,8 +98,8 @@ def test_binmask_requires_width():
 
 
 def test_env_property():
-    assert Knob("BN", KnobType.INT).env == "DEPLODOCK_BN"
-    assert Knob("MASK", KnobType.BINMASK).env == "DEPLODOCK_MASK"
+    assert Knob("BN", KnobType.INT).env == "EMMY_BN"
+    assert Knob("MASK", KnobType.BINMASK).env == "EMMY_MASK"
 
 
 # ---------------------------------------------------------------------------
@@ -109,13 +109,13 @@ def test_env_property():
 
 def test_narrow_unpinned_returns_candidates_unchanged(monkeypatch):
     k = Knob("BN", KnobType.INT)
-    monkeypatch.delenv("DEPLODOCK_BN", raising=False)
+    monkeypatch.delenv("EMMY_BN", raising=False)
     assert k.narrow((16, 32, 64)) == (16, 32, 64)
 
 
 def test_narrow_pinned_keeps_matching_candidate(monkeypatch):
     k = Knob("BN", KnobType.INT)
-    monkeypatch.setenv("DEPLODOCK_BN", "32")
+    monkeypatch.setenv("EMMY_BN", "32")
     assert k.narrow((16, 32, 64)) == (32,)
 
 
@@ -124,28 +124,28 @@ def test_narrow_pinned_out_of_set_is_authoritative(monkeypatch):
     # tuple is honored, not silently dropped. Downstream structural gates
     # (divisibility, threads-per-CTA budget, …) still apply.
     k = Knob("BN", KnobType.INT)
-    monkeypatch.setenv("DEPLODOCK_BN", "128")
+    monkeypatch.setenv("EMMY_BN", "128")
     assert k.narrow((16, 32, 64)) == (128,)
 
 
 def test_narrow_accepts_arbitrary_iterable(monkeypatch):
     k = Knob("BN", KnobType.INT)
-    monkeypatch.setenv("DEPLODOCK_BN", "16")
+    monkeypatch.setenv("EMMY_BN", "16")
     # generator, not a tuple
     assert k.narrow(x for x in (8, 16, 32)) == (16,)
 
 
 def test_narrow_bool(monkeypatch):
     k = Knob("FLAG", KnobType.BOOL)
-    monkeypatch.setenv("DEPLODOCK_FLAG", "true")
+    monkeypatch.setenv("EMMY_FLAG", "true")
     assert k.narrow((True, False)) == (True,)
-    monkeypatch.setenv("DEPLODOCK_FLAG", "0")
+    monkeypatch.setenv("EMMY_FLAG", "0")
     assert k.narrow((True, False)) == (False,)
 
 
 def test_narrow_binmask_rejected(monkeypatch):
     k = Knob("MASK", KnobType.BINMASK)
-    monkeypatch.setenv("DEPLODOCK_MASK", "111")
+    monkeypatch.setenv("EMMY_MASK", "111")
     with pytest.raises(ValueError, match="BINMASK"):
         k.narrow((0b000, 0b111))
 
@@ -195,7 +195,7 @@ def test_warp_tile_features_from_warp_tile():
     """``_warp_tile_features`` builds the ``D_*`` family from the warp form of the ``TILE`` codec
     (``WM·WN·32`` threads, ``WM·FM·atom_m × WN·FN·atom_n`` output) — the atom cell dims (16×8 for
     ``m16n8k16``) are read off the parsed atom. A scalar ``TILE`` value → empty."""
-    from deplodock.compiler.pipeline.search.features import _warp_tile_features  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.features import _warp_tile_features  # noqa: PLC0415
 
     wf = _warp_tile_features({"TILE": "a:mma_m16n8k16_f16/w2x2/f2x2/k2", "S_ext_free_prod": 2048 * 2048})
     assert wf["D_threads"] == 128.0  # WM·WN·32
@@ -206,63 +206,63 @@ def test_warp_tile_features_from_warp_tile():
 
 
 # ---------------------------------------------------------------------------
-# DEPLODOCK_KNOBS aggregate env var
+# EMMY_KNOBS aggregate env var
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture(autouse=True)
-def _restore_deplodock_env():
-    """``apply_knobs_env`` writes ``DEPLODOCK_<K>`` via ``config.set_knob`` —
+def _restore_emmy_env():
+    """``apply_knobs_env`` writes ``EMMY_<K>`` via ``config.set_knob`` —
     a direct ``os.environ`` write monkeypatch can't undo (``delenv`` on an
     absent var records nothing to restore), so splatted pins used to leak
     into later tests in the same xdist worker (pin-sensitive planner tests
     then enumerate under stray ``BK``/``BM``/``BN`` pins). Snapshot + restore
-    the whole ``DEPLODOCK_*`` namespace around each test."""
+    the whole ``EMMY_*`` namespace around each test."""
     import os  # noqa: PLC0415
 
-    saved = {k: v for k, v in os.environ.items() if k.startswith("DEPLODOCK_")}
+    saved = {k: v for k, v in os.environ.items() if k.startswith("EMMY_")}
     yield
-    for k in [k for k in os.environ if k.startswith("DEPLODOCK_")]:
+    for k in [k for k in os.environ if k.startswith("EMMY_")]:
         if k not in saved:
             del os.environ[k]
     os.environ.update(saved)
 
 
 def test_apply_knobs_env_splats_into_individual_keys(monkeypatch):
-    """Aggregate env var sets ``DEPLODOCK_<K>`` per entry."""
-    monkeypatch.delenv("DEPLODOCK_BK", raising=False)
-    monkeypatch.delenv("DEPLODOCK_BM", raising=False)
-    monkeypatch.delenv("DEPLODOCK_BN", raising=False)
+    """Aggregate env var sets ``EMMY_<K>`` per entry."""
+    monkeypatch.delenv("EMMY_BK", raising=False)
+    monkeypatch.delenv("EMMY_BM", raising=False)
+    monkeypatch.delenv("EMMY_BN", raising=False)
     applied = apply_knobs_env("BK=2,BM=16,BN=128")
-    assert applied == {"DEPLODOCK_BK": "2", "DEPLODOCK_BM": "16", "DEPLODOCK_BN": "128"}
+    assert applied == {"EMMY_BK": "2", "EMMY_BM": "16", "EMMY_BN": "128"}
 
 
 def test_apply_knobs_env_individual_takes_precedence(monkeypatch):
-    """An explicit ``DEPLODOCK_<K>`` wins over the aggregate."""
-    monkeypatch.setenv("DEPLODOCK_BK", "4")
-    monkeypatch.delenv("DEPLODOCK_BM", raising=False)
+    """An explicit ``EMMY_<K>`` wins over the aggregate."""
+    monkeypatch.setenv("EMMY_BK", "4")
+    monkeypatch.delenv("EMMY_BM", raising=False)
     applied = apply_knobs_env("BK=2,BM=16")
-    assert "DEPLODOCK_BK" not in applied  # not clobbered
-    assert applied == {"DEPLODOCK_BM": "16"}
+    assert "EMMY_BK" not in applied  # not clobbered
+    assert applied == {"EMMY_BM": "16"}
     import os
 
-    assert os.environ["DEPLODOCK_BK"] == "4"
-    assert os.environ["DEPLODOCK_BM"] == "16"
+    assert os.environ["EMMY_BK"] == "4"
+    assert os.environ["EMMY_BM"] == "16"
 
 
 def test_apply_knobs_env_tolerates_whitespace(monkeypatch):
     """Whitespace around keys / values / separators is stripped."""
-    monkeypatch.delenv("DEPLODOCK_BK", raising=False)
-    monkeypatch.delenv("DEPLODOCK_BM", raising=False)
+    monkeypatch.delenv("EMMY_BK", raising=False)
+    monkeypatch.delenv("EMMY_BM", raising=False)
     applied = apply_knobs_env(" BK = 2 ,  BM=16 ")
-    assert applied == {"DEPLODOCK_BK": "2", "DEPLODOCK_BM": "16"}
+    assert applied == {"EMMY_BK": "2", "EMMY_BM": "16"}
 
 
 def test_apply_knobs_env_skips_empty_entries(monkeypatch):
     """Empty entries (trailing comma, double comma) are skipped."""
-    monkeypatch.delenv("DEPLODOCK_BK", raising=False)
+    monkeypatch.delenv("EMMY_BK", raising=False)
     applied = apply_knobs_env("BK=2,,")
-    assert applied == {"DEPLODOCK_BK": "2"}
+    assert applied == {"EMMY_BK": "2"}
 
 
 def test_apply_knobs_env_rejects_missing_equals():
@@ -279,9 +279,9 @@ def test_apply_knobs_env_rejects_empty_key():
 
 def test_parse_knob_spec_grammar():
     """``parse_knob_spec`` is the one owner of the ``K1=V1,K2=V2`` grammar
-    (``DEPLODOCK_KNOBS`` splat + ``run --ab``): uppercased keys in spec order,
+    (``EMMY_KNOBS`` splat + ``run --ab``): uppercased keys in spec order,
     whitespace tolerated, empties skipped, values kept as raw strings."""
-    from deplodock.compiler.pipeline.knob import parse_knob_spec
+    from emmy.compiler.pipeline.knob import parse_knob_spec
 
     assert parse_knob_spec(" bk = 2 ,, BM=16, STAGE=d2/cp ") == {"BK": "2", "BM": "16", "STAGE": "d2/cp"}
     assert parse_knob_spec("") == {}
@@ -291,9 +291,9 @@ def test_parse_knob_spec_grammar():
 
 def test_apply_knobs_env_uppercases_key(monkeypatch):
     """Lowercased keys round-trip to the upper-case env-var convention."""
-    monkeypatch.delenv("DEPLODOCK_BK", raising=False)
+    monkeypatch.delenv("EMMY_BK", raising=False)
     applied = apply_knobs_env("bk=2")
-    assert applied == {"DEPLODOCK_BK": "2"}
+    assert applied == {"EMMY_BK": "2"}
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +345,7 @@ def test_knob_features_stage_codec():
 def test_stage_codec_reg_depth_roundtrip():
     """``Stage.parse``/``spell`` round-trip the ``p<reg_depth>`` token; ``p1`` (the default) is
     omitted so an unstaged-register config spells byte-identical to before the field existed."""
-    from deplodock.compiler.ir.schedule import Stage  # noqa: PLC0415
+    from emmy.compiler.ir.schedule import Stage  # noqa: PLC0415
 
     assert Stage.parse("d3/cp/ring/p2") == Stage(depth=3, transport="cp.async", ring=True, reg_depth=2)
     assert Stage.parse("d2/cp/p4").reg_depth == 4
@@ -353,7 +353,7 @@ def test_stage_codec_reg_depth_roundtrip():
     assert Stage(depth=2, transport="cp.async", reg_depth=2).spell() == "d2/cp/p2"
     assert Stage(depth=2, transport="cp.async", reg_depth=1).spell() == "d2/cp"  # p1 omitted
     # reg_depth is perf-only — NOT part of the structural signature (golden-match stability).
-    from deplodock.compiler.pipeline.search.features import _stage_sig  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.features import _stage_sig  # noqa: PLC0415
 
     assert _stage_sig({"STAGE": "d2/cp/p2"}) == _stage_sig({"STAGE": "d2/cp"})
 
@@ -409,17 +409,17 @@ def test_format_tuning_knobs_skips_struct():
 
 def test_format_tuning_knobs_canonical_order():
     """The codec knobs render in canonical order (``KNOB_ORDER`` = ``TILE``, ``REDUCE``,
-    ``STAGE``), not alphabetical — shared with the ``deplodock eval`` golden tables."""
+    ``STAGE``), not alphabetical — shared with the ``emmy eval`` golden tables."""
     out = format_tuning_knobs({"STAGE": "d2/cp", "REDUCE": "b32", "TILE": "a:mma_m16n8k16_f16/w2x2"})
     assert out == "TILE=a:mma_m16n8k16_f16/w2x2, REDUCE=b32, STAGE=d2/cp"
 
 
 def test_apply_knobs_env_no_raw_falls_back_to_env(monkeypatch):
-    """With no ``raw`` argument, the function reads ``DEPLODOCK_KNOBS``."""
-    monkeypatch.delenv("DEPLODOCK_BK", raising=False)
-    monkeypatch.setenv("DEPLODOCK_KNOBS", "BK=8")
+    """With no ``raw`` argument, the function reads ``EMMY_KNOBS``."""
+    monkeypatch.delenv("EMMY_BK", raising=False)
+    monkeypatch.setenv("EMMY_KNOBS", "BK=8")
     applied = apply_knobs_env()
-    assert applied == {"DEPLODOCK_BK": "8"}
+    assert applied == {"EMMY_BK": "8"}
 
 
 # --- Axis-named schedule keys -------------------------------------------------
@@ -477,7 +477,7 @@ def test_multinode_flash_keys_apart_and_pools_per_node():
     (REDUCE@sk); the two ``TILE`` keys are distinct flat entries (no collision), and the schedule
     geometry featurizes **per node** and sum-pools — ``D_threads`` = QK threads + PV threads, and
     ``MMA_tier`` = 2.0 over the two warp nodes. This is the case the flat one-key schema can't express."""
-    from deplodock.compiler.pipeline.search.features import _node_axes, _node_slice, _schedule_node_features
+    from emmy.compiler.pipeline.search.features import _node_axes, _node_slice, _schedule_node_features
 
     qk_tile = "a:mma_m16n8k16_f16/w4x1/f2x2/k2"  # WM·WN·32 = 128 threads
     pv_tile = "a:mma_m16n8k16_f16/w2x2/f4x1/k2"  # WM·WN·32 = 128 threads
@@ -502,7 +502,7 @@ def test_node_slice_addresses_per_node_struct():
     """Each node reads its OWN reduce extent: an addressed ``S_ext_reduce_prod@<axis>`` overrides the
     shared bare value in that node's slice (so QK@d and PV@sk featurize with different K depths), while
     a one-node kernel with a bare ``S_ext_reduce_prod`` featurizes byte-identically (bare fallback)."""
-    from deplodock.compiler.pipeline.search.features import _node_slice
+    from emmy.compiler.pipeline.search.features import _node_slice
 
     knobs = {"TILE@d": "n4/f2", "TILE@sk": "n2/f4", "S_ext_reduce_prod": 8.0, "S_ext_reduce_prod@sk": 512.0}
     assert _node_slice(knobs, "d")["S_ext_reduce_prod"] == 8.0  # no @d override → bare fallback

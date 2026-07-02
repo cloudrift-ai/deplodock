@@ -1,4 +1,4 @@
-"""CLI tests for ``deplodock tune --gpus / --devices`` device resolution (no GPU).
+"""CLI tests for ``emmy tune --gpus / --devices`` device resolution (no GPU).
 
 ``_resolve_devices`` maps the flags to a device-id list (``--devices`` wins) and,
 for two or more devices, enforces homogeneity (one perf key per tune). The
@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from deplodock.commands import tune
+from emmy.commands import tune
 
 
 def _args(*, gpus=None, devices=None):

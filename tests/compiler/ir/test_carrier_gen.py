@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.dtype import F32
-from deplodock.compiler.ir.stmt import Accum, Assign
-from deplodock.compiler.ir.stmt import carrier as _carrier
-from deplodock.compiler.ir.stmt.carrier import UnstableCarrierError
-from deplodock.compiler.pipeline.passes.lowering.tile._carrier import denom, exp_family_twist, expect
+from emmy.compiler.dtype import F32
+from emmy.compiler.ir.stmt import Accum, Assign
+from emmy.compiler.ir.stmt import carrier as _carrier
+from emmy.compiler.ir.stmt.carrier import UnstableCarrierError
+from emmy.compiler.pipeline.passes.lowering.tile._carrier import denom, exp_family_twist, expect
 
 _COMMUTATIVE = {"add", "multiply", "maximum"}
 

@@ -8,11 +8,11 @@ are ``external_reads``, and every eligibility judgment stays in the rule.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Select, Write
-from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import SelectBranch
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.stmt import Accum, Assign, Load, Loop, Select, Write
+from emmy.compiler.ir.stmt.body import Body
+from emmy.compiler.ir.stmt.leaves import SelectBranch
 
 
 def _ld(name: str, src: str, *idx: str) -> Load:

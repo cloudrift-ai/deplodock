@@ -14,12 +14,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.ir.axis import Axis, AxisRole
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.schedule import TilePlan
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Write
-from deplodock.compiler.ir.tile import Contraction, Map, ReducePlan, Reduction, TileOp
-from deplodock.compiler.ir.tile.ops import axis_role, lower, reduce_loop, reduce_plan
+from emmy.compiler.ir.axis import Axis, AxisRole
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.schedule import TilePlan
+from emmy.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Write
+from emmy.compiler.ir.tile import Contraction, Map, ReducePlan, Reduction, TileOp
+from emmy.compiler.ir.tile.ops import axis_role, lower, reduce_loop, reduce_plan
 
 
 def _sum_loop(role: AxisRole = AxisRole.PLANAR) -> Loop:
@@ -157,7 +157,7 @@ def test_contraction_lower_appends_the_fused_epilogue() -> None:
 def test_nodify_reduce_lifts_a_bare_loop_in_body_map_to_a_reduction() -> None:
     """A flat ``Map`` holding just the annotated reduce loop nodifies to a **bare** ``Reduction`` node
     carrying the partition — ``lower`` byte-identical, ``reduce_plan`` reading the node."""
-    from deplodock.compiler.ir.tile.ops import nodify_reduce
+    from emmy.compiler.ir.tile.ops import nodify_reduce
 
     loop = _sum_loop()
     flat = Map(body=(loop,))
@@ -171,7 +171,7 @@ def test_nodify_reduce_lifts_a_bare_loop_in_body_map_to_a_reduction() -> None:
 def test_nodify_reduce_keeps_a_projection_tail_as_a_wrapping_map() -> None:
     """A fused-epilogue contraction (loop then projection) nodifies to ``Map(body=proj,
     source=Reduction)`` — the tail rides the wrapping ``Map``, the partition the ``Reduction``."""
-    from deplodock.compiler.ir.tile.ops import nodify_reduce
+    from emmy.compiler.ir.tile.ops import nodify_reduce
 
     loop = _sum_loop(role=AxisRole.CONTRACTION)
     proj = (Assign(name="y", op="relu", args=("acc",)), Write(output="out", index=(Var("m"),), value="y"))
@@ -189,7 +189,7 @@ def test_nodify_reduce_keeps_a_projection_tail_as_a_wrapping_map() -> None:
 def test_factor_k_splits_the_axis_with_distinct_names() -> None:
     """``_factor_k`` factors a static ``k`` into ``ksplit × kslice`` — distinct names, the σ
     reconstructing the absolute index ``ksplit·(K/w) + kslice``."""
-    from deplodock.compiler.pipeline.passes.lowering.tile._schedule import _factor_k
+    from emmy.compiler.pipeline.passes.lowering.tile._schedule import _factor_k
 
     ksplit, kslice, sigma = _factor_k(Axis("k", 512), 2)
     assert (ksplit.name, ksplit.extent.as_static()) == ("k_ks", 2)
@@ -202,8 +202,8 @@ def test_splitk_reduction_over_contraction_is_no_double_reduce() -> None:
     reduce sums partials across CTAs, the inner contraction folds its slice. ``lower`` is a SINGLE
     ``for ksplit:[for kslice: mul-add]`` with DISTINCT axis names (not ``for k:[for k:]``), and it
     still classifies as a ``CONTRACTION`` carrying the GRID (cta) partition."""
-    from deplodock.compiler.ir.elementwise import ElementwiseImpl
-    from deplodock.compiler.pipeline.passes.lowering.tile._schedule import _factor_k
+    from emmy.compiler.ir.elementwise import ElementwiseImpl
+    from emmy.compiler.pipeline.passes.lowering.tile._schedule import _factor_k
 
     c = _contraction()  # k_axis = k(256)
     ksplit, kslice, sigma = _factor_k(c.k_axis, 2)
@@ -257,9 +257,9 @@ def test_flash_op_is_a_two_contraction_tree() -> None:
     singleton ``pj`` reduce). No ``source`` asymmetry: the streaming reduce's ``source`` is ``None``
     and the walk reaches both QK and PV as nodes on ``partial``. Its A is computed, not a gmem load;
     its O-fold consumes the PV output ``O_i__pv``, so the ⊗ is a contraction node, not an inline FMA."""
-    from deplodock.compiler.dim import Dim
-    from deplodock.compiler.ir.tile.ir import Contraction as _C
-    from deplodock.compiler.pipeline.passes.lowering.tile._flash import _flash_op
+    from emmy.compiler.dim import Dim
+    from emmy.compiler.ir.tile.ir import Contraction as _C
+    from emmy.compiler.pipeline.passes.lowering.tile._flash import _flash_op
 
     op = _flash_op("Q", "K", "V", [1, 2], Dim(16), Dim(16), 8, 8)  # (batch, s_q, s_k, head_dim, d_v)
     red = op.source  # Map(body=[O/l proj], source=Reduction(TWISTED, partial=[QK, ..., PV, ...]))
@@ -322,7 +322,7 @@ def test_contraction_computed_a_factorizes_at_the_scalar_tier() -> None:
     replication treats ``P = exp(S)`` as ordinary K-loop body, so the emitted kernel carries the ``exp``
     inside the reduce loop feeding the accumulator. This is the standalone P@V the tensor-core-flash
     rebuild rests on (proved at the scalar tier; the mma tier reads the same operand as a fragment)."""
-    from deplodock.compiler.pipeline.passes.lowering.kernel._factor import factorize
+    from emmy.compiler.pipeline.passes.lowering.kernel._factor import factorize
 
     tile = factorize(TileOp(op=_pv_contraction()), root=None)
     exps = [s for s in tile.body.iter_of_type(Assign) if s.op.name == "exp"]

@@ -4,16 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Deplodock is a Python tool for deploying and benchmarking LLM inference on GPU servers. It supports vLLM and SGLang engines, provides a CLI for local and remote (SSH) deployment of models via Docker Compose, plus automated benchmarking across multiple servers.
+Emmy is a Python tool for deploying and benchmarking LLM inference on GPU servers. It supports vLLM and SGLang engines, provides a CLI for local and remote (SSH) deployment of models via Docker Compose, plus automated benchmarking across multiple servers.
 
 The `README.md` is intentionally short — example-driven, no narrative. For details, consult the ARCHITECTURE.md files:
 
-- **CLI usage** (deploy local/ssh/cloud, bench, teardown, vm, hardware-aware deploy, fixed-host mode, experiments, CI workflow) → [`deplodock/commands/ARCHITECTURE.md`](deplodock/commands/ARCHITECTURE.md)
-- **Serving** (vLLM out-of-tree embedding plugin — deplodock-compiled kernels behind vLLM's `/v1/embeddings`; `serving` extra) → [`deplodock/serving/ARCHITECTURE.md`](deplodock/serving/ARCHITECTURE.md)
-- **Recipe format** (matrices/cross/zip combinators, variant filtering, deep merge, named fields, extra_args validation, command recipes, aggregate, docker_options, driver/cuda pinning, SGLang) → [`deplodock/recipe/ARCHITECTURE.md`](deplodock/recipe/ARCHITECTURE.md)
-- **Compiler** (Graph IR dialects, passes, backends) → [`deplodock/compiler/ARCHITECTURE.md`](deplodock/compiler/ARCHITECTURE.md) and child docs
+- **CLI usage** (deploy local/ssh/cloud, bench, teardown, vm, hardware-aware deploy, fixed-host mode, experiments, CI workflow) → [`emmy/commands/ARCHITECTURE.md`](emmy/commands/ARCHITECTURE.md)
+- **Serving** (vLLM out-of-tree embedding plugin — emmy-compiled kernels behind vLLM's `/v1/embeddings`; `serving` extra) → [`emmy/serving/ARCHITECTURE.md`](emmy/serving/ARCHITECTURE.md)
+- **Recipe format** (matrices/cross/zip combinators, variant filtering, deep merge, named fields, extra_args validation, command recipes, aggregate, docker_options, driver/cuda pinning, SGLang) → [`emmy/recipe/ARCHITECTURE.md`](emmy/recipe/ARCHITECTURE.md)
+- **Compiler** (Graph IR dialects, passes, backends) → [`emmy/compiler/ARCHITECTURE.md`](emmy/compiler/ARCHITECTURE.md) and child docs
 - **Pipeline / autotune** (pass framework, knob/fork system, learned-prior search, two-level tune) →
-  [`deplodock/compiler/pipeline/ARCHITECTURE.md`](deplodock/compiler/pipeline/ARCHITECTURE.md)
+  [`emmy/compiler/pipeline/ARCHITECTURE.md`](emmy/compiler/pipeline/ARCHITECTURE.md)
 - **Tile lowering** (LoopOp → TileOp; **purely algebraic moveset — no shape specializations**. The stored tile IR is
   growing into a tree of **structural nodes** (all in `ir/tile/ir.py`): a `PLANAR`/`TWISTED` reduce lifts to a
   typed `Reduction` (its `Carrier` + reduce `axis` + `partial` split out, the fold `Loop` synthesized on demand, holding
@@ -24,7 +24,7 @@ The `README.md` is intentionally short — example-driven, no narrative. For det
   (`ops.axis_role`/`reduce_loop` recurse through `Map.source`), and `ops.lower` flattens any node back to the same loop
   nest — there is no stored `Monoid`/`Semiring` node kind (those wrappers were retired). Flash attention is the
   `TWISTED` reduce on the streaming schedule, a twisted monoid is a monoid, selected structurally not as a distinct
-  kind) → [`deplodock/compiler/pipeline/passes/ARCHITECTURE.md`](deplodock/compiler/pipeline/passes/ARCHITECTURE.md)
+  kind) → [`emmy/compiler/pipeline/passes/ARCHITECTURE.md`](emmy/compiler/pipeline/passes/ARCHITECTURE.md)
 
 When the user asks about a CLI flag, recipe field, or matrix combinator, read the relevant ARCHITECTURE.md before
 answering — they hold the detail that is no longer in this file or the README.
@@ -35,17 +35,17 @@ answering — they hold the detail that is no longer in this file or the README.
 - `make setup` to create the virtual environment and install dependencies
 - Docker and Docker Compose for local deployments
 - `HF_TOKEN` environment variable for HuggingFace model downloads
-- `DEPLODOCK_DUMP_DIR` environment variable (optional) — when set, all compiler stages dump intermediate artifacts (graphs, CUDA kernels, execution plans) to this directory for debugging. Per kernel, the dump also writes a `<kname>.torch.json` reproducer — the original PyTorch ops that kernel implements (sliced by op provenance), with an `i/N` coverage header (full vs partial) — runnable via `deplodock run --ir <kname>.torch.json --bench` to reproduce accuracy / latency vs torch for that op. Kernels are named after the ops they realize (`k_rms_norm`, `k_sdpa_reduce`)
-- `DEPLODOCK_TUNE_DB` environment variable (optional) — overrides the default tuning SQLite cache path
-  (`~/.cache/deplodock/autotune.db`). `deplodock tune` reads from / writes to this path. NOTE: greedy `compile` / `run`
+- `EMMY_DUMP_DIR` environment variable (optional) — when set, all compiler stages dump intermediate artifacts (graphs, CUDA kernels, execution plans) to this directory for debugging. Per kernel, the dump also writes a `<kname>.torch.json` reproducer — the original PyTorch ops that kernel implements (sliced by op provenance), with an `i/N` coverage header (full vs partial) — runnable via `emmy run --ir <kname>.torch.json --bench` to reproduce accuracy / latency vs torch for that op. Kernels are named after the ops they realize (`k_rms_norm`, `k_sdpa_reduce`)
+- `EMMY_TUNE_DB` environment variable (optional) — overrides the default tuning SQLite cache path
+  (`~/.cache/emmy/autotune.db`). `emmy tune` reads from / writes to this path. NOTE: greedy `compile` / `run`
   pick forks from the global learned `Prior`, **not** the DB (the old `_best_fork` DB→fork replay was removed). The prior
-  is a separate JSON checkpoint (`DEPLODOCK_PRIOR_FILE` → `~/.cache/deplodock/prior.json`) that `tune` writes and
-  `compile` / `run` read. See [`deplodock/compiler/pipeline/ARCHITECTURE.md`](deplodock/compiler/pipeline/ARCHITECTURE.md)
+  is a separate JSON checkpoint (`EMMY_PRIOR_FILE` → `~/.cache/emmy/prior.json`) that `tune` writes and
+  `compile` / `run` read. See [`emmy/compiler/pipeline/ARCHITECTURE.md`](emmy/compiler/pipeline/ARCHITECTURE.md)
   for the prior / two-level autotune story.
 
-All `DEPLODOCK_*` config env vars are read and written through one module — `deplodock/config.py`, the sole owner of
-`os.environ` for these vars (the `DEPLODOCK_<KNOB>` namespace is the one exception, owned by
-`compiler/pipeline/knob.py`; provider/secret vars stay with `deplodock/redact.py`). CLI `--flag` overrides (e.g.
+All `EMMY_*` config env vars are read and written through one module — `emmy/config.py`, the sole owner of
+`os.environ` for these vars (the `EMMY_<KNOB>` namespace is the one exception, owned by
+`compiler/pipeline/knob.py`; provider/secret vars stay with `emmy/redact.py`). CLI `--flag` overrides (e.g.
 `--nvcc-flags`) resolve through `config.py` inside the library, not the command layer, so programmatic callers and tests
 get the same precedence. `config.py` is the source of truth for the full var list — do not maintain a copy here.
 
@@ -58,7 +58,7 @@ make test
 `make test` compiles CUDA kernels at **`-Xcicc -O1`** (the suite is `nvcc`/`cicc`-compile-bound, not GPU-bound — `-O1`
 dodges the cicc/LLVM unroll blowup on big register-tile kernels, ~3× faster wall time). This is the **correctness lane**:
 `-O1` changes runtime perf, not numerics, and the deployable perf tests (`tests/perf`, `-m perf`) are skipped here — they
-run at `-O3` via `make bench-kernels`. To re-run the suite at deployable `-O3`, prefix `DEPLODOCK_NVCC_FLAGS=` (empty) or
+run at `-O3` via `make bench-kernels`. To re-run the suite at deployable `-O3`, prefix `EMMY_NVCC_FLAGS=` (empty) or
 run `pytest` directly.
 
 Or for a specific test file:
@@ -80,26 +80,27 @@ same worker.
 ## CLI Commands
 
 The full CLI reference — every command, subcommand, flag, and example — lives in
-[`deplodock/commands/ARCHITECTURE.md`](deplodock/commands/ARCHITECTURE.md). Do **not** duplicate that reference here; read
+[`emmy/commands/ARCHITECTURE.md`](emmy/commands/ARCHITECTURE.md). Do **not** duplicate that reference here; read
 it before answering any CLI-flag question. Quickstart for the common paths:
 
 | Command | Purpose |
 | --- | --- |
-| `deplodock deploy {local,ssh,cloud} <model> …` | deploy via docker compose locally, over SSH, or on a freshly provisioned cloud VM |
-| `deplodock bench recipes/* [--filter KEY=PATTERN] [--no-teardown]` | deploy + benchmark + teardown across cloud VMs; `teardown <run_dir>` cleans up afterwards |
-| `deplodock vm create gpu --gpu NAME --gpu-count N` | provision a GPU VM by name (also `vm create/delete {gcp,cloudrift}`) |
-| `deplodock serve <model> [--generate] [--bench] [vllm flags…]` | serve an embedding (or `--generate` chat) model via vLLM with the deplodock plugin |
-| `deplodock compile <model_or_ir> [--layer N] [--ir STAGE] [--dynamic …] [--target sm_NN]` | trace + run the compiler; print or save any IR stage |
-| `deplodock run <model_or_ir_or_--code> [--bench]` | compile + execute on the CUDA backend, check accuracy, optionally bench vs eager / `torch.compile` |
-| `deplodock tune <target> [--bench] [--gpus N]` | two-level autotune; writes the learned prior + tune DB |
-| `deplodock eval {knobs,analytic,prior,golden,variants,failures} [--dataset {golden,db,nodes}]` | inspect the prior / tune DB |
-| `deplodock {pull,trace,generate,inspect,compare} …` | model download, IR tracing, the naive generation oracle, IR inspection, dump diffing |
+| `emmy deploy {local,ssh,cloud} <model> …` | deploy via docker compose locally, over SSH, or on a freshly provisioned cloud VM |
+| `emmy bench recipes/* [--filter KEY=PATTERN] [--no-teardown]` | deploy + benchmark + teardown across cloud VMs; `teardown <run_dir>` cleans up afterwards |
+| `emmy vm create gpu --gpu NAME --gpu-count N` | provision a GPU VM by name (also `vm create/delete {gcp,cloudrift}`) |
+| `emmy serve <model> [--generate] [--bench] [vllm flags…]` | serve an embedding (or `--generate` chat) model via vLLM with the emmy plugin |
+| `emmy compile <model_or_ir> [--layer N] [--ir STAGE] [--dynamic …] [--target sm_NN]` | trace + run the compiler; print or save any IR stage |
+| `emmy run <model_or_ir_or_--code> [--bench]` | compile + execute on the CUDA backend, check accuracy, optionally bench vs eager / `torch.compile` |
+| `emmy tune <target> [--bench] [--gpus N]` | two-level autotune; writes the learned prior + tune DB |
+| `emmy eval {knobs,analytic,prior,golden,variants,failures} [--dataset {golden,db,nodes}]` | inspect the prior / tune DB |
+| `emmy {pull,trace,generate,inspect,compare} …` | model download, IR tracing, the naive generation oracle, IR inspection, dump diffing |
 
 Quick test models / scripts (for local iteration):
 
 - Ungated Llama-arch smoke model: `TinyLlama/TinyLlama-1.1B-Chat-v1.0`; GPU embedding model (0.6B): `Qwen/Qwen3-Embedding-0.6B`
 - Benchmark/profiling helpers live under `scripts/` (`bench_block.py`, `bench_model_kernels.py`, `bench_gen_*.py`,
-  `profile_gen_decode.py`, `new_models.py`) — run with `--help` for usage; the skills that drive them document the flows.
+  `profile_gen_decode.py`, `new_models.py`, `merge_node_db.py`, `remote_node_tune.py`) — run with `--help` for usage;
+  the skills that drive them document the flows.
 
 ## Key Make Targets
 
@@ -108,7 +109,7 @@ Quick test models / scripts (for local iteration):
   kernels at `-Xcicc -O1` for ~3× faster nvcc (correctness lane; perf tests use `-O3` via `make bench-kernels`)
 - `make lint` — run `ruff check` and `ruff format --check`
 - `make format` — auto-format code and fix lint violations
-- `make bench` — run benchmarks (`deplodock bench recipes/*`)
+- `make bench` — run benchmarks (`emmy bench recipes/*`)
 - `make bench-kernels` — run per-kernel perf comparison vs PyTorch (`tests/perf/`, requires CUDA)
 - `make clean` — remove venv and generated files
 
@@ -118,7 +119,7 @@ These are invariants — they hold for every doc change, no exceptions:
 
 - **Plans are ephemeral. Never reference `plans/*.md` from durable docs (CLAUDE.md, README.md, any `ARCHITECTURE.md`) or
   from code (comments/docstrings).** A plan is a transient working note; anything worth keeping gets written into the
-  durable doc itself, and the plan pointer is dropped. (`grep -rn "plans/" --include='*.py' deplodock/` and over the
+  durable doc itself, and the plan pointer is dropped. (`grep -rn "plans/" --include='*.py' emmy/` and over the
   durable docs must stay empty.) Plan *lifecycle* is governed by the Contribution Instructions below.
 - **`ARCHITECTURE.md` files describe concepts, invariants, and the few key entry-point modules — not every file.** Do
   NOT add exhaustive per-file "module tree" tables or `file.py:123` line-number citations; they churn on every refactor

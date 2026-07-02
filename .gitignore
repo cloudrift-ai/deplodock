@@ -1,5 +1,6 @@
 # Python virtual environment
 venv/
+venv
 
 # Python cache
 __pycache__/
@@ -10,7 +11,7 @@ __pycache__/
 *.cubin
 
 # Python egg-info
-deplodock.egg-info/
+*.egg-info/
 
 # Build and run artifacts
 dist/

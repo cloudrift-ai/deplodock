@@ -53,7 +53,7 @@ def device_compute_capability() -> tuple[int, int] | None:
 # is rejected by nvcc (``Unsupported gpu architecture 'sm_89a'`` — the ``a``
 # variant only exists for sm_90a+), and ``ldmatrix`` itself faults at runtime on
 # at least this Ada (sm_89) host. Tests that FORCE the warp tier via
-# ``DEPLODOCK_MMA`` pins therefore can't run below sm_90; they exercise the
+# ``EMMY_MMA`` pins therefore can't run below sm_90; they exercise the
 # deployed path on sm_90+ CI.
 requires_sm90 = pytest.mark.skipif(
     (device_compute_capability() or (0, 0)) < (9, 0),
@@ -63,13 +63,13 @@ requires_sm90 = pytest.mark.skipif(
 
 @pytest.fixture(params=["f32", "f16"], ids=["f32", "f16"])
 def dtype(request):
-    """Parametrize a test over the float dtypes deplodock supports.
+    """Parametrize a test over the float dtypes emmy supports.
 
-    Yields a :class:`deplodock.compiler.dtype.DataType`. Tests that take
+    Yields a :class:`emmy.compiler.dtype.DataType`. Tests that take
     this fixture run once per dtype; combined with ``run_graph``, the
     full matrix is (backend × dtype) minus the loop/fp16 cell (skipped).
     """
-    from deplodock.compiler import dtype as _dt  # noqa: PLC0415
+    from emmy.compiler import dtype as _dt  # noqa: PLC0415
 
     return _dt.get(request.param)
 
@@ -108,9 +108,9 @@ def matmul_graph(m: int, k: int, n: int) -> Graph:  # noqa: F821
     Callers needing the input shapes can derive them as
     ``{"a": (m, k), "b": (k, n)}``.
     """
-    from deplodock.compiler.graph import Graph, Tensor  # noqa: PLC0415
-    from deplodock.compiler.ir.base import InputOp  # noqa: PLC0415
-    from deplodock.compiler.ir.frontend.ir import MatmulOp  # noqa: PLC0415
+    from emmy.compiler.graph import Graph, Tensor  # noqa: PLC0415
+    from emmy.compiler.ir.base import InputOp  # noqa: PLC0415
+    from emmy.compiler.ir.frontend.ir import MatmulOp  # noqa: PLC0415
 
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (m, k)), node_id="a")
@@ -150,19 +150,19 @@ def run_graph(request) -> Callable:
 
     def _run(graph, input_data: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         if kind == "numpy":
-            from deplodock.compiler.backend.numpy import NumpyBackend
+            from emmy.compiler.backend.numpy import NumpyBackend
 
             be = NumpyBackend()
             return be.run(be.compile(graph), input_data=input_data)[0].outputs
         if kind == "loop":
-            from deplodock.compiler.backend.loop import LoopBackend
+            from emmy.compiler.backend.loop import LoopBackend
 
             be = LoopBackend()
             compiled = be.compile(graph)
             augmented = _inject_constants(dict(input_data), compiled)
             return be.run(compiled, input_data=augmented)[0].outputs
         # cuda
-        from deplodock.compiler.backend.cuda.backend import CudaBackend
+        from emmy.compiler.backend.cuda.backend import CudaBackend
 
         be = CudaBackend()
         compiled = be.compile(graph)
@@ -183,7 +183,7 @@ def _inject_constants(input_data: dict[str, np.ndarray], graph) -> dict[str, np.
     permutation here so the loop / numpy backends see the post-transpose
     data.
     """
-    from deplodock.compiler.ir.base import ConstantOp
+    from emmy.compiler.ir.base import ConstantOp
 
     for nid, node in graph.nodes.items():
         if not isinstance(node.op, ConstantOp):
@@ -195,7 +195,7 @@ def _inject_constants(input_data: dict[str, np.ndarray], graph) -> dict[str, np.
             continue
         src = input_data.get(node.op.name)
         if src is not None:
-            from deplodock.compiler.loader.binder import apply_load_ops
+            from emmy.compiler.loader.binder import apply_load_ops
 
             arr = np.asarray(src, dtype=np.float32)
             if node.op.load_ops and node.op.source_shape is not None:
@@ -242,8 +242,8 @@ def run_inner_reward(
     production outer loop does. Mirrors the old signature so call sites only rename."""
     import asyncio
 
-    from deplodock.compiler.pipeline import TuningSearch
-    from deplodock.compiler.pipeline.search.two_level import _inner_reward_async
+    from emmy.compiler.pipeline import TuningSearch
+    from emmy.compiler.pipeline.search.two_level import _inner_reward_async
 
     if ucb_c is None:
         ucb_c = TuningSearch.DEFAULT_UCB_C
@@ -268,7 +268,7 @@ def run_two_level(graph, **kwargs):
     """Synchronously run the async :func:`two_level.run_two_level_tune` for tests."""
     import asyncio
 
-    from deplodock.compiler.pipeline.search.two_level import run_two_level_tune
+    from emmy.compiler.pipeline.search.two_level import run_two_level_tune
 
     return asyncio.run(run_two_level_tune(graph, **kwargs))
 
@@ -294,7 +294,7 @@ def dyn_M(mode: str, M: int):
     """``Dim('seq_len')`` for ``mode == 'dynamic'``, else the int ``M``. The
     one-liner that turns a static graph builder into a static/dynamic one."""
     if mode == "dynamic":
-        from deplodock.compiler.dim import Dim
+        from emmy.compiler.dim import Dim
 
         return Dim("seq_len")
     return M

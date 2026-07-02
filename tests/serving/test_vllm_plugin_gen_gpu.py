@@ -1,12 +1,12 @@
-"""In-process vLLM engine test of the deplodock **generative** plugin (Phase 3).
+"""In-process vLLM engine test of the emmy **generative** plugin (Phase 3).
 
 ``perf``-marked (deselected by default): needs CUDA + cupy + vllm. Saves a TINY random
 Llama (vocab matches a cached Llama tokenizer, 2 layers — no network), serves it through
-``DeplodockGenModel`` in an in-process vLLM engine (real paged ``Attention`` + KV cache +
+``EmmyGenModel`` in an in-process vLLM engine (real paged ``Attention`` + KV cache +
 ``lm_head`` + ``get_rope``), and greedily generates — checking it runs end-to-end and that
 the generated tokens agree with HF eager greedy on the same weights. This is the Phase-3
 integration proof: vLLM accepts the model, allocates the KV-cache spec from the per-layer
-``Attention`` prefixes, and the deplodock↔attention forward interleave produces correct logits.
+``Attention`` prefixes, and the emmy↔attention forward interleave produces correct logits.
 """
 
 import pytest
@@ -48,7 +48,7 @@ def test_vllm_gen_plugin_matches_hf_eager(tmp_path, monkeypatch):
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
 
-    import deplodock.serving
+    import emmy.serving
 
     # The test process has CUDA initialized (conftest seeds it); vLLM's forked
     # EngineCore would die on re-init. Run the engine in-process instead.
@@ -56,7 +56,7 @@ def test_vllm_gen_plugin_matches_hf_eager(tmp_path, monkeypatch):
 
     model_dir = tmp_path / "tiny_llama"
     _save_tiny_llama(str(model_dir))
-    deplodock.serving.register()  # ModelRegistry.register_model("DeplodockGenModel", ...)
+    emmy.serving.register()  # ModelRegistry.register_model("EmmyGenModel", ...)
 
     tok = transformers.AutoTokenizer.from_pretrained(TOKENIZER)
     prompt_ids = tok("The quick brown fox", add_special_tokens=True)["input_ids"]
@@ -66,7 +66,7 @@ def test_vllm_gen_plugin_matches_hf_eager(tmp_path, monkeypatch):
         model=str(model_dir),
         tokenizer=TOKENIZER,
         runner="generate",
-        hf_overrides={"architectures": ["DeplodockGenModel"]},
+        hf_overrides={"architectures": ["EmmyGenModel"]},
         enforce_eager=True,
         dtype="float16",
         max_model_len=128,
@@ -87,4 +87,4 @@ def test_vllm_gen_plugin_matches_hf_eager(tmp_path, monkeypatch):
     ref_gen = ref_out[0, len(prompt_ids) :].tolist()
     # Compare the WHOLE greedy sequence: token 0 comes from prefill, tokens 1.. are KV-cache
     # DECODE steps (num_tokens=1), so this validates the decode path, not just prefill.
-    assert gen == ref_gen, f"greedy mismatch (deplodock vs HF eager): {gen} vs {ref_gen}"
+    assert gen == ref_gen, f"greedy mismatch (emmy vs HF eager): {gen} vs {ref_gen}"

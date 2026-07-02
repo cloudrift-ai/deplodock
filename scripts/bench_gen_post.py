@@ -4,13 +4,13 @@
 Times one decoder layer's carved `post` subgraph (o_proj + residual + post-norm + gated MLP)
 three ways at decode width:
 
-  - deplodock symbolic (hint 512) run at M=1          -> the "before" (pathological masked tile)
-  - deplodock static decode-bucket M=<bucket> (shipped) -> the fix (`DeplodockGenRunner` decode path)
+  - emmy symbolic (hint 512) run at M=1          -> the "before" (pathological masked tile)
+  - emmy static decode-bucket M=<bucket> (shipped) -> the fix (`EmmyGenRunner` decode path)
   - torch eager (cuBLAS) at M=<bucket>                -> the baseline
 
-The deplodock rows use the committed CUDA-graph capture path (`capture_program_graph` +
+The emmy rows use the committed CUDA-graph capture path (`capture_program_graph` +
 `time_program_window`) — the same pure-GPU, dispatch-free measurement `run --bench` uses; the
-programs are compiled by the exact `_compile_split` calls `DeplodockGenRunner.from_model` makes.
+programs are compiled by the exact `_compile_split` calls `EmmyGenRunner.from_model` makes.
 The cuBLAS row is the same `post` module in torch eager, `torch.cuda.Event`-timed.
 
 Usage:
@@ -33,10 +33,10 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 
-def _time_deplodock(prog_wrap, arrays, *, warmup, window, windows):
+def _time_emmy(prog_wrap, arrays, *, warmup, window, windows):
     """Capture the program graph at the current (rebound) shape; return median per-replay ms
     over ``windows`` windows of ``window`` back-to-back replays (CUDA-graph-captured)."""
-    from deplodock.compiler.backend.gpu_lock import gpu_lock
+    from emmy.compiler.backend.gpu_lock import gpu_lock
 
     prog = prog_wrap.program
     feed = dict(zip(prog_wrap.input_names, arrays, strict=True))
@@ -95,8 +95,8 @@ def main():
         logger.error("CUDA GPU required for benchmarking")
         sys.exit(1)
 
-    from deplodock.compiler.trace.huggingface import build_attention_split_wrapper
-    from deplodock.serving.gen_runner import _compile_split
+    from emmy.compiler.trace.huggingface import build_attention_split_wrapper
+    from emmy.serving.gen_runner import _compile_split
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -137,8 +137,8 @@ def main():
     rb = np.random.randn(bucket, hidden).astype(np_dtype)
     timing = {"warmup": args.warmup, "window": args.window, "windows": args.windows}
 
-    sym_at_1 = _time_deplodock(post_sym, [a1, r1], **timing)
-    bucket_ms = _time_deplodock(post_bucket, [ab, rb], **timing)
+    sym_at_1 = _time_emmy(post_sym, [a1, r1], **timing)
+    bucket_ms = _time_emmy(post_bucket, [ab, rb], **timing)
     eager = _time_eager(post_w, [torch.from_numpy(ab).cuda(), torch.from_numpy(rb).cuda()], **timing)
 
     logger.info(
@@ -150,8 +150,8 @@ def main():
     )
     logger.info("%-44s%10s%12s", "post @ decode", "ms", "vs cuBLAS")
     logger.info("-" * 66)
-    logger.info("%-44s%10.3f%11.1fx", "deplodock symbolic (hint 512) @ M=1 (before)", sym_at_1, sym_at_1 / eager)
-    logger.info("%-44s%10.3f%11.1fx", f"deplodock static decode-bucket M={bucket} (shipped)", bucket_ms, bucket_ms / eager)
+    logger.info("%-44s%10.3f%11.1fx", "emmy symbolic (hint 512) @ M=1 (before)", sym_at_1, sym_at_1 / eager)
+    logger.info("%-44s%10.3f%11.1fx", f"emmy static decode-bucket M={bucket} (shipped)", bucket_ms, bucket_ms / eager)
     logger.info("%-44s%10.3f%11.1fx", f"torch eager (cuBLAS) @ M={bucket}", eager, 1.0)
 
 

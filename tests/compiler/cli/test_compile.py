@@ -1,4 +1,4 @@
-"""CLI tests for ``deplodock compile`` argument handling and ``--code``."""
+"""CLI tests for ``emmy compile`` argument handling and ``--code``."""
 
 
 def test_compile_code_torch_ir(run_cli):

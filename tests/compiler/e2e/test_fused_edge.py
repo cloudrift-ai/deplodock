@@ -18,11 +18,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from deplodock.compiler import dtype as _dt
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler import dtype as _dt
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
 from tests.compiler.conftest import requires_cuda
 
 F16 = _dt.get("f16")
@@ -69,7 +69,7 @@ _PRODUCER_REFS = {
 
 
 def _compile_run(g: Graph, ins: dict) -> tuple[np.ndarray, list[str]]:
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     be = CudaBackend()
     compiled = be.compile(g)
@@ -88,7 +88,7 @@ def test_fused_map_matmul(tier, producer, monkeypatch):
     the ``warp`` cells additionally demand the ``mma.sync`` tier (the compute-filled A slab;
     the broadcast cell is xfailed — its producer recognizes as a flat un-annotated ``Map``)."""
     if tier == "warp":
-        monkeypatch.setenv("DEPLODOCK_TILE", _WARP_TILE)
+        monkeypatch.setenv("EMMY_TILE", _WARP_TILE)
     g, extra = _producer_graph(producer)
     g.add_node(InputOp(), [], Tensor("w", (_K, _N), F16), node_id="w")
     g.add_node(MatmulOp(), ["xn", "w"], Tensor("o", (_M, _N), F16), node_id="o")
@@ -114,7 +114,7 @@ def test_fused_rmsnorm_linear(tier, monkeypatch):
     whose shape keeps the sweep in-tail). The ``warp`` cell demands the mma tier on the fused
     matmul (xfailed — the MONOID-producer warp fused edge is not rebuilt)."""
     if tier == "warp":
-        monkeypatch.setenv("DEPLODOCK_TILE", _WARP_TILE)
+        monkeypatch.setenv("EMMY_TILE", _WARP_TILE)
     S, H, inter = 32, 1024, 3072
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (1, S, H), F16), node_id="x")

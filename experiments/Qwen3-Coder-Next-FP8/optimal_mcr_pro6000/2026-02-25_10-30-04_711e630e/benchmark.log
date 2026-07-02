@@ -1,6 +1,6 @@
-[2026-02-25 10:30:04] [root] Run directory: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000/2026-02-25_10-30-04_711e630e
-[2026-02-25 10:30:04] [root] Run directory: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e
-[2026-02-25 10:30:04] [root] Run directory: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/vllm_vs_sglang_pro6000/2026-02-25_10-30-04_711e630e
+[2026-02-25 10:30:04] [root] Run directory: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000/2026-02-25_10-30-04_711e630e
+[2026-02-25 10:30:04] [root] Run directory: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e
+[2026-02-25 10:30:04] [root] Run directory: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-Next-FP8/vllm_vs_sglang_pro6000/2026-02-25_10-30-04_711e630e
 [2026-02-25 10:30:04] [root] 
 [2026-02-25 10:30:04] [root] Running 16 benchmark task(s) in 1 execution group(s)
 [2026-02-25 10:30:04] [root] Parallel mode (max workers: 1)
@@ -44,7 +44,7 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-02-25 11:38:02] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Running benchmark...
-[2026-02-25 11:47:31] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/pro6000_c8_mcr8_vllm_benchmark.txt
+[2026-02-25 11:47:31] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/pro6000_c8_mcr8_vllm_benchmark.txt
 [2026-02-25 11:47:31] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Tearing down...
 [2026-02-25 11:47:31] [orchestrate] Tearing down...
 [2026-02-25 11:47:34] [orchestrate] Teardown complete.
@@ -73,7 +73,7 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-02-25 11:52:48] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Running benchmark...
-[2026-02-25 12:01:45] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/pro6000_c12_mcr12_vllm_benchmark.txt
+[2026-02-25 12:01:45] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/pro6000_c12_mcr12_vllm_benchmark.txt
 [2026-02-25 12:01:45] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Tearing down...
 [2026-02-25 12:01:45] [orchestrate] Tearing down...
 [2026-02-25 12:01:48] [orchestrate] Teardown complete.
@@ -102,7 +102,7 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-02-25 12:07:05] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Running benchmark...
-[2026-02-25 12:13:36] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/pro6000_c16_mcr16_vllm_benchmark.txt
+[2026-02-25 12:13:36] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/pro6000_c16_mcr16_vllm_benchmark.txt
 [2026-02-25 12:13:36] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Tearing down...
 [2026-02-25 12:13:36] [orchestrate] Tearing down...
 [2026-02-25 12:13:39] [orchestrate] Teardown complete.
@@ -131,7 +131,7 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-02-25 12:18:48] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Running benchmark...
-[2026-02-25 12:25:33] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/pro6000_c20_mcr20_vllm_benchmark.txt
+[2026-02-25 12:25:33] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/pro6000_c20_mcr20_vllm_benchmark.txt
 [2026-02-25 12:25:33] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Tearing down...
 [2026-02-25 12:25:33] [orchestrate] Tearing down...
 [2026-02-25 12:25:37] [orchestrate] Teardown complete.
@@ -190,7 +190,7 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-02-25 13:36:05] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Running benchmark...
-[2026-02-25 13:41:41] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/pro6000_c28_mcr28_vllm_benchmark.txt
+[2026-02-25 13:41:41] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/pro6000_c28_mcr28_vllm_benchmark.txt
 [2026-02-25 13:41:41] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Tearing down...
 [2026-02-25 13:41:41] [orchestrate] Tearing down...
 [2026-02-25 13:41:45] [orchestrate] Teardown complete.
@@ -219,7 +219,7 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-02-25 13:47:01] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Running benchmark...
-[2026-02-25 13:52:12] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/pro6000_c32_mcr32_vllm_benchmark.txt
+[2026-02-25 13:52:12] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/pro6000_c32_mcr32_vllm_benchmark.txt
 [2026-02-25 13:52:12] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Tearing down...
 [2026-02-25 13:52:12] [orchestrate] Tearing down...
 [2026-02-25 13:52:16] [orchestrate] Teardown complete.
@@ -248,7 +248,7 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-02-25 13:57:28] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Running benchmark...
-[2026-02-25 14:02:52] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/pro6000_c36_mcr36_vllm_benchmark.txt
+[2026-02-25 14:02:52] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/pro6000_c36_mcr36_vllm_benchmark.txt
 [2026-02-25 14:02:52] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Tearing down...
 [2026-02-25 14:02:52] [orchestrate] Tearing down...
 [2026-02-25 14:02:55] [orchestrate] Teardown complete.
@@ -277,7 +277,7 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-02-25 14:08:10] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Running benchmark...
-[2026-02-25 14:12:30] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/pro6000_c40_mcr40_vllm_benchmark.txt
+[2026-02-25 14:12:30] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/pro6000_c40_mcr40_vllm_benchmark.txt
 [2026-02-25 14:12:30] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Tearing down...
 [2026-02-25 14:12:30] [orchestrate] Tearing down...
 [2026-02-25 14:12:34] [orchestrate] Teardown complete.
@@ -287,9 +287,9 @@ Example curl:
 [2026-02-25 14:30:51] [cloudrift] Instance terminated.
 [2026-02-25 14:30:51] [pro6000_x_1] VM deleted.
 [2026-02-25 14:30:51] [pro6000_x_1] Completed group: pro6000_x_1
-[2026-02-25 14:30:51] [root] Manifest written to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000/2026-02-25_10-30-04_711e630e/manifest.json
-[2026-02-25 14:30:51] [root] Manifest written to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/manifest.json
-[2026-02-25 14:30:51] [root] Manifest written to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/vllm_vs_sglang_pro6000/2026-02-25_10-30-04_711e630e/manifest.json
+[2026-02-25 14:30:51] [root] Manifest written to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000/2026-02-25_10-30-04_711e630e/manifest.json
+[2026-02-25 14:30:51] [root] Manifest written to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/manifest.json
+[2026-02-25 14:30:51] [root] Manifest written to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-Next-FP8/vllm_vs_sglang_pro6000/2026-02-25_10-30-04_711e630e/manifest.json
 [2026-02-25 14:30:51] [root] 
 [2026-02-25 14:30:51] [root] SUMMARY
 [2026-02-25 14:30:51] [root] Successful: 14/16
@@ -313,6 +313,6 @@ Example curl:
 [2026-02-25 14:30:51] [root]    - pro6000_sglang_benchmark.txt
 [2026-02-25 14:30:51] [root] 
 [2026-02-25 14:30:51] [root] All done!
-[2026-02-25 14:30:51] [root] Full logs saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000/2026-02-25_10-30-04_711e630e/benchmark.log
-[2026-02-25 14:30:51] [root] Full logs saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/benchmark.log
-[2026-02-25 14:30:51] [root] Full logs saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/vllm_vs_sglang_pro6000/2026-02-25_10-30-04_711e630e/benchmark.log
+[2026-02-25 14:30:51] [root] Full logs saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000/2026-02-25_10-30-04_711e630e/benchmark.log
+[2026-02-25 14:30:51] [root] Full logs saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/benchmark.log
+[2026-02-25 14:30:51] [root] Full logs saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-Next-FP8/vllm_vs_sglang_pro6000/2026-02-25_10-30-04_711e630e/benchmark.log

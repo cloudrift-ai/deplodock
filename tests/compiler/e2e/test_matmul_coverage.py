@@ -23,16 +23,16 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.dtype import BF16, F16, F32
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline import CUDA_PASSES, TILE_PASSES, Pipeline
-from deplodock.compiler.pipeline.knob import family_value
-from deplodock.compiler.pipeline.search.features import mma_atom
+from emmy.compiler.context import Context
+from emmy.compiler.dim import Dim
+from emmy.compiler.dtype import BF16, F16, F32
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler.pipeline import CUDA_PASSES, TILE_PASSES, Pipeline
+from emmy.compiler.pipeline.knob import family_value
+from emmy.compiler.pipeline.search.features import mma_atom
 
 from ..conftest import dyn_M, requires_cuda, requires_sm90
 
@@ -82,11 +82,11 @@ def _matmul_graph(mode: str):
 
 
 def _run(mode: str, tile: str, monkeypatch) -> tuple[np.ndarray, np.ndarray, str]:
-    """Compile the matmul under the pinned ``DEPLODOCK_TILE`` codec, run on seeded inputs at the
+    """Compile the matmul under the pinned ``EMMY_TILE`` codec, run on seeded inputs at the
     mode's runtime M, and return ``(output, reference, kernel_source)``."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
-    monkeypatch.setenv("DEPLODOCK_TILE", tile)
+    monkeypatch.setenv("EMMY_TILE", tile)
     m = _DYN_M if mode == "dynamic" else _M
     rng = np.random.default_rng(0)
     a = rng.standard_normal((1, m, _K), dtype=np.float32)
@@ -157,11 +157,11 @@ _REDUCE_VARIANTS = {
 def test_matmul_reduce_partition(variant, monkeypatch):
     """A non-output-tiled contraction honours a cooperative / ILP ``REDUCE`` pin (silently ignored
     before): the K axis partitions across threads / register chains and still matches numpy."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     spec, marker = _REDUCE_VARIANTS[variant]
-    monkeypatch.delenv("DEPLODOCK_TILE", raising=False)
-    monkeypatch.setenv("DEPLODOCK_REDUCE", spec)
+    monkeypatch.delenv("EMMY_TILE", raising=False)
+    monkeypatch.setenv("EMMY_REDUCE", spec)
     rng = np.random.default_rng(0)
     a = rng.standard_normal((1, _M, _K), dtype=np.float32)
     b = rng.standard_normal((_K, _N), dtype=np.float32)
@@ -226,10 +226,10 @@ def test_matmul_reg_tile_epilogue(epilogue, mode, monkeypatch):
     """A register-tiled contraction with a fused pointwise epilogue stays accurate AND folds the
     epilogue into the ONE contraction kernel (no separate elementwise launch), over static and
     symbolic M."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
-    monkeypatch.setenv("DEPLODOCK_TILE", _EPILOGUE_TILE)
-    monkeypatch.setenv("DEPLODOCK_REDUCE", "")  # serial K: the subject is the fused epilogue, not the restored split-K fork
+    monkeypatch.setenv("EMMY_TILE", _EPILOGUE_TILE)
+    monkeypatch.setenv("EMMY_REDUCE", "")  # serial K: the subject is the fused epilogue, not the restored split-K fork
     m = _DYN_M if mode == "dynamic" else _M
     rng = np.random.default_rng(0)
     feed = {"a": rng.standard_normal((1, m, _K), dtype=np.float32), "b": rng.standard_normal((_K, _N), dtype=np.float32)}
@@ -274,11 +274,11 @@ def test_scalar_matmul_stages_through_pipeline(monkeypatch) -> None:
     stamped ``knobs`` codec is the RESOLVED spelling (honest variant identity): the clamped ``d1/tma``
     for the ``d2/tma`` pin, and the explicit OFF ``""`` when resolution declines — the row must
     describe the pipeline the kernel actually has."""
-    from deplodock.compiler.ir.tile import TileOp  # noqa: PLC0415
+    from emmy.compiler.ir.tile import TileOp  # noqa: PLC0415
 
-    monkeypatch.setenv("DEPLODOCK_TILE", "n16x16/f2x2")
-    monkeypatch.setenv("DEPLODOCK_REDUCE", "")  # serial K: the subject is stage resolution, not the split fork
-    monkeypatch.setenv("DEPLODOCK_STAGE", "d2/tma")
+    monkeypatch.setenv("EMMY_TILE", "n16x16/f2x2")
+    monkeypatch.setenv("EMMY_REDUCE", "")  # serial K: the subject is stage resolution, not the split fork
+    monkeypatch.setenv("EMMY_STAGE", "d2/tma")
     out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((9, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
     # ``STAGE`` is keyed ``@<k_axis>`` (axis-named schedule knob); ``family_value`` reads it.
@@ -288,7 +288,7 @@ def test_scalar_matmul_stages_through_pipeline(monkeypatch) -> None:
     assert stage.depth == 1, stage  # the scalar tier is single-buffer — the pinned d2 is clamped
     assert stage.bk_elems == 64, stage  # derived fit-to-smem K-chunk (K=64 divides; slab fits 48 KiB)
 
-    monkeypatch.setenv("DEPLODOCK_STAGE", "d1/sync")  # sync is not a contraction transport
+    monkeypatch.setenv("EMMY_STAGE", "d1/sync")  # sync is not a contraction transport
     out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((9, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
     assert family_value(tile_op.knobs, "STAGE") == "", tile_op.knobs  # declined pin stamps the OFF value
@@ -301,11 +301,11 @@ def test_warp_matmul_refuses_wspec_while_inert(monkeypatch, caplog) -> None:
     the perf DB that no kernel ever ran. Flips back to stamping when wspec codegen lands."""
     import logging as _logging  # noqa: PLC0415
 
-    from deplodock.compiler.ir.tile import TileOp  # noqa: PLC0415
+    from emmy.compiler.ir.tile import TileOp  # noqa: PLC0415
 
-    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w2x2/f2x2/k2")  # warp (mma) tier
-    monkeypatch.setenv("DEPLODOCK_STAGE", "d2/cp")
-    monkeypatch.setenv("DEPLODOCK_WSPEC", "p2:q8")
+    monkeypatch.setenv("EMMY_TILE", "a:mma_m16n8k16_f16/w2x2/f2x2/k2")  # warp (mma) tier
+    monkeypatch.setenv("EMMY_STAGE", "d2/cp")
+    monkeypatch.setenv("EMMY_WSPEC", "p2:q8")
     with caplog.at_level(_logging.WARNING):
         out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((9, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
@@ -325,12 +325,12 @@ def test_wspec_degrades_to_uniform(monkeypatch, tile: str, stage: str | None) ->
     """The ``WSPEC`` pin degrades to uniform (``workers=None``) when the producer is illegal — no
     ``STAGE`` to drive, or the scalar tier (no mma consumer). The same pin-validity rule the other
     codecs follow; the knob is then not explicitly stamped (only the ``off=""`` default)."""
-    from deplodock.compiler.ir.tile import TileOp  # noqa: PLC0415
+    from emmy.compiler.ir.tile import TileOp  # noqa: PLC0415
 
-    monkeypatch.setenv("DEPLODOCK_TILE", tile)
+    monkeypatch.setenv("EMMY_TILE", tile)
     if stage is not None:
-        monkeypatch.setenv("DEPLODOCK_STAGE", stage)
-    monkeypatch.setenv("DEPLODOCK_WSPEC", "p2")
+        monkeypatch.setenv("EMMY_STAGE", stage)
+    monkeypatch.setenv("EMMY_WSPEC", "p2")
     out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((9, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
     assert tile_op.workers is None
@@ -343,13 +343,13 @@ def test_wspec_degrades_to_uniform(monkeypatch, tile: str, stage: str | None) ->
 def test_staged_scalar_matmul_matches_reference(monkeypatch, stage_mask, shape) -> None:
     """Every stage subset (both / A-only / B-only / none) lowers to a kernel that
     matches a numpy matmul, including a masked (non-divisor) output axis."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
-    monkeypatch.setenv("DEPLODOCK_STAGE", stage_mask)
+    monkeypatch.setenv("EMMY_STAGE", stage_mask)
     # Pin a small in-budget scalar tile so the deep-BK emission default can't overflow the staged
     # smem slab on the larger shape. Legacy env pins route through the ingest mapper.
     for k, v in (("BN", "16"), ("BM", "16"), ("FN", "2"), ("FM", "2"), ("BK", "16")):
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+        monkeypatch.setenv(f"EMMY_{k}", v)
     M, N, K = shape
     rng = np.random.default_rng(0)
     a = rng.standard_normal((M, K), dtype=np.float32)
@@ -372,7 +372,7 @@ def _random(shape: tuple[int, ...], *, seed: int = 0, scale: float = 1.0, dtype=
 
 
 def _numpy_reference(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    from deplodock.compiler.backend.numpy import NumpyBackend  # noqa: PLC0415
+    from emmy.compiler.backend.numpy import NumpyBackend  # noqa: PLC0415
 
     be = NumpyBackend()
     return be.run(be.compile(graph), input_data=inputs)[0].outputs
@@ -407,8 +407,8 @@ def test_fused_prologue_compiles_in_budget(case):
     divisible-N case, opens a SECOND ``x_smem`` slab)."""
     import re as _re  # noqa: PLC0415
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
-    from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
 
     spec = _FUSED_PROLOGUE[case]
     M, K, N = 2, 1024, spec["N"]
@@ -461,10 +461,10 @@ _F16 = "f16"
 def _mma_matmul_graph(mode: str, M: int, N: int, K: int, out: str, trans: bool):
     """A hand-built ``C[i,j] = Σ_k A[i,k]·B[…]`` over f16 operands; ``trans`` makes B ``[j,k]``
     (Q@Kᵀ, K last). ``mode='dynamic'`` makes the M (row) axis symbolic (the dynamic-grid tier)."""
-    from deplodock.compiler.ir.elementwise import ElementwiseImpl  # noqa: PLC0415
-    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
-    from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write  # noqa: PLC0415
-    from deplodock.compiler.ir.stmt import Accum, Assign  # noqa: PLC0415
+    from emmy.compiler.ir.elementwise import ElementwiseImpl  # noqa: PLC0415
+    from emmy.compiler.ir.expr import Var  # noqa: PLC0415
+    from emmy.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write  # noqa: PLC0415
+    from emmy.compiler.ir.stmt import Accum, Assign  # noqa: PLC0415
 
     Mg = dyn_M(mode, M)
     i, j, k = Axis("i", Mg), Axis("j", N), Axis("k", K)
@@ -505,10 +505,10 @@ def _mma_symbolic_k_graph(M: int, N: int, *, trans: bool):
     """``C[i,j] = Σ_k A[i,k]·B[…]`` with the contraction (K) axis SYMBOLIC (``seq_len``) — ``trans``
     makes B ``[j,k]`` (transposed-B, K contiguous), so the warp mma zero-fills the masked-K tail
     through the (n,k)-swapped trans helper. M / N are static tile divisors (no M/N mask)."""
-    from deplodock.compiler.ir.elementwise import ElementwiseImpl  # noqa: PLC0415
-    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
-    from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write  # noqa: PLC0415
-    from deplodock.compiler.ir.stmt import Accum, Assign  # noqa: PLC0415
+    from emmy.compiler.ir.elementwise import ElementwiseImpl  # noqa: PLC0415
+    from emmy.compiler.ir.expr import Var  # noqa: PLC0415
+    from emmy.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write  # noqa: PLC0415
+    from emmy.compiler.ir.stmt import Accum, Assign  # noqa: PLC0415
 
     Kg = Dim("seq_len")
     i, j, k = Axis("i", M), Axis("j", N), Axis("k", Kg)
@@ -548,7 +548,7 @@ def _mma_symbolic_k_graph(M: int, N: int, *, trans: bool):
 def _compile_run_mma(graph, feed: dict) -> tuple[np.ndarray, str]:
     """Compile the (already WARP-pinned) graph and run it on the seeded f16 operands in ``feed``;
     return ``(output, kernel_source)``."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     be = CudaBackend()
     compiled = be.compile(graph)
@@ -574,11 +574,11 @@ _MMA_CASES = [
 @requires_sm90
 @requires_cuda
 def test_matmul_mma_coverage(M, N, K, out, trans, mode, monkeypatch):
-    """An f16×f16 matmul under the pinned ``DEPLODOCK_TILE`` codec lowers to ``mma.sync`` and
+    """An f16×f16 matmul under the pinned ``EMMY_TILE`` codec lowers to ``mma.sync`` and
     agrees with the f32 reference (within fp16 tolerance) — for canonical AND transposed-B
     operands, f16 AND f32 output, over a STATIC M (tile divisor) and a SYMBOLIC M run at a
     straddling length (the dynamic-grid tier + the masked-tile store)."""
-    monkeypatch.setenv("DEPLODOCK_TILE", _WARP_PIN)
+    monkeypatch.setenv("EMMY_TILE", _WARP_PIN)
     run_m = M if mode == "static" else M + 2
     rng = np.random.default_rng(0)
     a = (rng.standard_normal((run_m, K)) * 0.1).astype(np.float16)
@@ -604,10 +604,10 @@ def _mma_qk_graph(B: int, H: int, M: int, N: int, D: int):
     """A hand-built **batched, transposed-B** ``S[b,h,m,kv] = Σ_dd Q[b,h,m,dd]·K[b,h,kv,dd]`` over
     f16 operands — exactly the score contraction flash's warp materializer constructs (leading
     ``(b, h)`` batch axes carried verbatim, ``dd`` last in K's index so it's a ``b_trans`` Q@Kᵀ)."""
-    from deplodock.compiler.ir.elementwise import ElementwiseImpl  # noqa: PLC0415
-    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
-    from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write  # noqa: PLC0415
-    from deplodock.compiler.ir.stmt import Accum, Assign  # noqa: PLC0415
+    from emmy.compiler.ir.elementwise import ElementwiseImpl  # noqa: PLC0415
+    from emmy.compiler.ir.expr import Var  # noqa: PLC0415
+    from emmy.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write  # noqa: PLC0415
+    from emmy.compiler.ir.stmt import Accum, Assign  # noqa: PLC0415
 
     b, h, m, kv, dd = Axis("b", B), Axis("h", H), Axis("m", M), Axis("kv", N), Axis("dd", D)
     dd_loop = Loop(
@@ -642,7 +642,7 @@ def test_mma_batched_qk_matches_torch(B, H, M, N, D, monkeypatch):
     the warp-flash materializer rides (a ``Contraction`` whose ``lead_axes`` carry the batch dims)."""
     import torch  # noqa: PLC0415
 
-    monkeypatch.setenv("DEPLODOCK_TILE", _WARP_PIN)
+    monkeypatch.setenv("EMMY_TILE", _WARP_PIN)
     rng = np.random.default_rng(0)
     q = (rng.standard_normal((B, H, M, D)) * 0.1).astype(np.float16)
     k = (rng.standard_normal((B, H, N, D)) * 0.1).astype(np.float16)
@@ -659,10 +659,10 @@ def _mma_pv_graph(B: int, H: int, M: int, KV: int, D: int):
     """A hand-built **batched, canonical-B** ``O[b,h,m,d] = Σ_kv P[b,h,m,kv]·V[b,h,kv,d]`` over f16
     operands — the flash P@V contraction (the second mma): leading ``(b, h)`` batch axes, reduce over
     ``kv``, and V indexed ``[kv, d]`` (``kv`` first, the canonical non-transposed B)."""
-    from deplodock.compiler.ir.elementwise import ElementwiseImpl  # noqa: PLC0415
-    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
-    from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write  # noqa: PLC0415
-    from deplodock.compiler.ir.stmt import Accum, Assign  # noqa: PLC0415
+    from emmy.compiler.ir.elementwise import ElementwiseImpl  # noqa: PLC0415
+    from emmy.compiler.ir.expr import Var  # noqa: PLC0415
+    from emmy.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write  # noqa: PLC0415
+    from emmy.compiler.ir.stmt import Accum, Assign  # noqa: PLC0415
 
     b, h, m, d, kv = Axis("b", B), Axis("h", H), Axis("m", M), Axis("d", D), Axis("kv", KV)
     kv_loop = Loop(
@@ -697,7 +697,7 @@ def test_mma_batched_pv_matches_torch(B, H, M, KV, D, monkeypatch):
     with torch — the other half of the contraction reuse the warp-flash materializer rides."""
     import torch  # noqa: PLC0415
 
-    monkeypatch.setenv("DEPLODOCK_TILE", _WARP_PIN)
+    monkeypatch.setenv("EMMY_TILE", _WARP_PIN)
     rng = np.random.default_rng(0)
     p = (rng.standard_normal((B, H, M, KV)) * 0.1).astype(np.float16)
     v = (rng.standard_normal((B, H, KV, D)) * 0.1).astype(np.float16)
@@ -724,10 +724,10 @@ def _mma_epilogue_graph(mode: str, epilogue: str):
     g.add_node(InputOp(), [], Tensor("a", (Mg, K), dtype=F16), node_id="a")
     g.add_node(InputOp(), [], Tensor("b", (K, N), dtype=F16), node_id="b")
     if epilogue == "causal":
-        from deplodock.compiler.ir.elementwise import ElementwiseImpl  # noqa: PLC0415
-        from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var  # noqa: PLC0415
-        from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write  # noqa: PLC0415
-        from deplodock.compiler.ir.stmt import Accum, Assign, Select, SelectBranch  # noqa: PLC0415
+        from emmy.compiler.ir.elementwise import ElementwiseImpl  # noqa: PLC0415
+        from emmy.compiler.ir.expr import BinaryExpr, Literal, Var  # noqa: PLC0415
+        from emmy.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write  # noqa: PLC0415
+        from emmy.compiler.ir.stmt import Accum, Assign, Select, SelectBranch  # noqa: PLC0415
 
         i, j, k = Axis("i", Mg), Axis("j", N), Axis("k", K)
         op = LoopOp(
@@ -793,8 +793,8 @@ def test_matmul_mma_epilogue_coverage(epilogue, mode, monkeypatch):
     """A warp-tier matmul with a fused pointwise / causal epilogue stays accurate AND folds the
     epilogue into the ONE mma.sync kernel (the per-element ``RegStore`` chain), over static and
     symbolic M."""
-    monkeypatch.setenv("DEPLODOCK_TILE", _WARP_PIN)
-    monkeypatch.setenv("DEPLODOCK_REDUCE", "")  # serial K: the subject is the fused epilogue, not the restored split-K fork
+    monkeypatch.setenv("EMMY_TILE", _WARP_PIN)
+    monkeypatch.setenv("EMMY_REDUCE", "")  # serial K: the subject is the fused epilogue, not the restored split-K fork
     M = N = K = 128
     run_m = M if mode == "static" else M + 2
     rng = np.random.default_rng(1)
@@ -850,8 +850,8 @@ def _parity_mma_graph(mode: str, *, M: int):
 def transport(request, monkeypatch) -> str:
     """Pin the warp tile (``WARP`` codec) + the operand-staging transport (``STAGE`` codec —
     ``d2/cp`` = cp.async, ``d2/tma`` = cp.async.bulk.tensor). The "pinned knobs" fixture."""
-    monkeypatch.setenv("DEPLODOCK_TILE", _WARP_CODEC)
-    monkeypatch.setenv("DEPLODOCK_STAGE", "d2/tma" if request.param == "tma" else "d2/cp")
+    monkeypatch.setenv("EMMY_TILE", _WARP_CODEC)
+    monkeypatch.setenv("EMMY_STAGE", "d2/tma" if request.param == "tma" else "d2/cp")
     return request.param
 
 
@@ -883,7 +883,7 @@ def test_static_dynamic_mma_parity(shape_mode, transport, M):
     combos fire. Dynamic robustness at off-hint sizes is covered by the masked sweep below."""
     if transport == "tma" and not _supports_tma():
         pytest.skip("TMA needs sm_90+ (Hopper / Blackwell)")
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     be = CudaBackend()
     compiled = be.compile(_parity_mma_graph(shape_mode, M=M))
@@ -905,19 +905,19 @@ def test_staged_matches_gmem_direct_bit_for_bit(monkeypatch, M):
     """cp.async operand staging is a PURE perf transform: the staged kernel (``STAGE=d2/cp``) must
     produce **bit-identical** output to the gmem-direct baseline (same ``WARP`` tile, no ``STAGE``)
     on the same inputs — and actually stage (cp.async + smem slab) where the baseline does not."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     rng = np.random.default_rng(0)
     a = (rng.standard_normal((M, _PK)) * 0.1).astype(np.float16)
     b = (rng.standard_normal((_PK, _PN)) * 0.1).astype(np.float16)
 
     def _go(stage: str | None) -> tuple[np.ndarray, str]:
-        monkeypatch.setenv("DEPLODOCK_TILE", _WARP_CODEC)
-        monkeypatch.setenv("DEPLODOCK_REDUCE", "")  # serial K: the baseline must not reroute through the restored split-K fork
+        monkeypatch.setenv("EMMY_TILE", _WARP_CODEC)
+        monkeypatch.setenv("EMMY_REDUCE", "")  # serial K: the baseline must not reroute through the restored split-K fork
         if stage:
-            monkeypatch.setenv("DEPLODOCK_STAGE", stage)
+            monkeypatch.setenv("EMMY_STAGE", stage)
         else:
-            monkeypatch.delenv("DEPLODOCK_STAGE", raising=False)
+            monkeypatch.delenv("EMMY_STAGE", raising=False)
         be = CudaBackend()
         compiled = be.compile(_parity_mma_graph("static", M=M))
         src = compiled.nodes["o"].op.kernel_source
@@ -944,15 +944,15 @@ def test_register_double_buffer_matches_single_buffer_bit_for_bit(monkeypatch, t
     ping-pongs (``_a0_s0``/``_a0_s1`` fragments the single-buffer kernel does not emit)."""
     if tr == "tma" and not _supports_tma():
         pytest.skip("TMA needs sm_90+ (Hopper / Blackwell)")
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     rng = np.random.default_rng(0)
     a = (rng.standard_normal((M, _PK)) * 0.1).astype(np.float16)
     b = (rng.standard_normal((_PK, _PN)) * 0.1).astype(np.float16)
 
     def _go(stage: str) -> tuple[np.ndarray, str]:
-        monkeypatch.setenv("DEPLODOCK_TILE", _WARP_CODEC)
-        monkeypatch.setenv("DEPLODOCK_STAGE", stage)
+        monkeypatch.setenv("EMMY_TILE", _WARP_CODEC)
+        monkeypatch.setenv("EMMY_STAGE", stage)
         be = CudaBackend()
         compiled = be.compile(_parity_mma_graph("static", M=M))
         src = compiled.nodes["o"].op.kernel_source
@@ -975,19 +975,19 @@ def test_cp_async_deep_ring_matches_gmem_direct_bit_for_bit(monkeypatch, depth, 
     the cp.async copy overlaps the mma. It is a PURE perf transform: bit-identical to the gmem-direct
     baseline, and the kernel allocates ``depth`` ring slots (``depth`` cp.async ``commit_group``\\ s —
     the prologue primes ``depth-1``, the steady loop commits one prefetch per chunk)."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     rng = np.random.default_rng(1)
     a = (rng.standard_normal((M, _PK)) * 0.1).astype(np.float16)
     b = (rng.standard_normal((_PK, _PN)) * 0.1).astype(np.float16)
 
     def _go(stage: str | None) -> tuple[np.ndarray, str]:
-        monkeypatch.setenv("DEPLODOCK_TILE", _WARP_CODEC)
-        monkeypatch.setenv("DEPLODOCK_REDUCE", "")  # serial K: the baseline must not reroute through the restored split-K fork
+        monkeypatch.setenv("EMMY_TILE", _WARP_CODEC)
+        monkeypatch.setenv("EMMY_REDUCE", "")  # serial K: the baseline must not reroute through the restored split-K fork
         if stage:
-            monkeypatch.setenv("DEPLODOCK_STAGE", stage)
+            monkeypatch.setenv("EMMY_STAGE", stage)
         else:
-            monkeypatch.delenv("DEPLODOCK_STAGE", raising=False)
+            monkeypatch.delenv("EMMY_STAGE", raising=False)
         be = CudaBackend()
         compiled = be.compile(_parity_mma_graph("static", M=M))
         src = compiled.nodes["o"].op.kernel_source
@@ -1012,19 +1012,19 @@ def test_tma_deep_ring_matches_gmem_direct_bit_for_bit(monkeypatch, depth, M):
     gmem-direct baseline, allocating ``depth`` ring slots."""
     if not _supports_tma():
         pytest.skip("TMA needs sm_90+ (Hopper / Blackwell)")
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     rng = np.random.default_rng(2)
     a = (rng.standard_normal((M, _PK)) * 0.1).astype(np.float16)
     b = (rng.standard_normal((_PK, _PN)) * 0.1).astype(np.float16)
 
     def _go(stage: str | None) -> tuple[np.ndarray, str]:
-        monkeypatch.setenv("DEPLODOCK_TILE", _WARP_CODEC)
-        monkeypatch.setenv("DEPLODOCK_REDUCE", "")  # serial K: the baseline must not reroute through the restored split-K fork
+        monkeypatch.setenv("EMMY_TILE", _WARP_CODEC)
+        monkeypatch.setenv("EMMY_REDUCE", "")  # serial K: the baseline must not reroute through the restored split-K fork
         if stage:
-            monkeypatch.setenv("DEPLODOCK_STAGE", stage)
+            monkeypatch.setenv("EMMY_STAGE", stage)
         else:
-            monkeypatch.delenv("DEPLODOCK_STAGE", raising=False)
+            monkeypatch.delenv("EMMY_STAGE", raising=False)
         be = CudaBackend()
         compiled = be.compile(_parity_mma_graph("static", M=M))
         src = compiled.nodes["o"].op.kernel_source
@@ -1046,10 +1046,10 @@ def test_bf16_operands_stage_via_cp_async(monkeypatch):
     bf16: feed the bits as uint16 and reinterpret the uint16 output.)"""
     import torch  # noqa: PLC0415
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
-    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_bf16/w2x2/f2x2/k2")
-    monkeypatch.setenv("DEPLODOCK_STAGE", "d2/cp")
+    monkeypatch.setenv("EMMY_TILE", "a:mma_m16n8k16_bf16/w2x2/f2x2/k2")
+    monkeypatch.setenv("EMMY_STAGE", "d2/cp")
     M = 256
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (M, _PK), dtype=BF16), node_id="a")
@@ -1097,10 +1097,10 @@ def test_mma_splitk_finalize(monkeypatch, finalize):
     on the tensor-core tier — mma present, NO ``atomicAdd`` — and is accurate. Atomic (``g2a``) is
     refused: an mma C-fragment can't ``atomicAdd`` (``RegStore`` has none), so the deferred kernel is
     the mma split-K path."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
-    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w2x2/f2x2/k2")
-    monkeypatch.setenv("DEPLODOCK_REDUCE", "g2k" if finalize == "deferred" else "g2a")
+    monkeypatch.setenv("EMMY_TILE", "a:mma_m16n8k16_f16/w2x2/f2x2/k2")
+    monkeypatch.setenv("EMMY_REDUCE", "g2k" if finalize == "deferred" else "g2a")
     m, k, n = 128, 512, 128
     be = CudaBackend()
     if finalize == "atomic":
@@ -1145,35 +1145,35 @@ def test_warp_static_k_indivisible_rejected(monkeypatch) -> None:
     """A WARP pin whose static K is not a multiple of ``atom_k·bk`` is rejected — the warp
     K-loop has no static-K tail masking, so lowering it would silently corrupt the result (the
     error the accuracy gate's mean-error escape clause misses)."""
-    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w1x1/f1x1/k1")  # K-step 16
+    monkeypatch.setenv("EMMY_TILE", "a:mma_m16n8k16_f16/w1x1/f1x1/k1")  # K-step 16
     with pytest.raises(ValueError, match="does not divide the static contraction K=100"):
         _run_tile_pass(_guard_mm_graph(128, 128, 100))
 
 
 def test_warp_static_k_divisible_ok(monkeypatch) -> None:
     """The same pin on a K that IS a multiple of the K-step lowers without the guard firing."""
-    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w1x1/f1x1/k1")
+    monkeypatch.setenv("EMMY_TILE", "a:mma_m16n8k16_f16/w1x1/f1x1/k1")
     _run_tile_pass(_guard_mm_graph(128, 128, 128))  # 128 % 16 == 0 — no raise
 
 
 def test_warp_symbolic_k_not_guarded(monkeypatch) -> None:
     """A symbolic K reaches the masked tier (ceil-div grid + zero-filled partial slab), so the
     static-K guard does not fire even when the hint is not a K-step multiple."""
-    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w1x1/f1x1/k2")  # K-step 32
+    monkeypatch.setenv("EMMY_TILE", "a:mma_m16n8k16_f16/w1x1/f1x1/k2")  # K-step 32
     _run_tile_pass(_guard_mm_graph(64, 128, Dim("seq_len")))  # symbolic K — no raise
 
 
 def test_tile_block_over_thread_limit_rejected(monkeypatch) -> None:
     """A TILE parallel tile over the 1024-thread/CTA limit is rejected at compile time instead
     of failing the launch with an opaque ``CUDA_ERROR_INVALID_VALUE``."""
-    monkeypatch.setenv("DEPLODOCK_TILE", "n128x128")  # 16384 threads
+    monkeypatch.setenv("EMMY_TILE", "n128x128")  # 16384 threads
     with pytest.raises(ValueError, match="exceeds the 1024-thread/CTA limit"):
         _run_tile_pass(_guard_mm_graph(256, 256, 256, dtype=F32))
 
 
 def test_tile_block_within_limit_ok(monkeypatch) -> None:
     """A TILE parallel tile within the thread limit lowers without the guard firing."""
-    monkeypatch.setenv("DEPLODOCK_TILE", "n8x8")  # 64 threads
+    monkeypatch.setenv("EMMY_TILE", "n8x8")  # 64 threads
     _run_tile_pass(_guard_mm_graph(256, 256, 256, dtype=F32))
 
 
@@ -1241,7 +1241,7 @@ def _demoted_symbolic_n_graph(K: int = 128) -> Graph:
 def _pv_softmax_graph(H: int = 16, N: int = 128) -> Graph:
     """Softmax(scores) @ V with the reduce K = ``seq_len`` symbolic (the SDPA P@V shape). Fusion
     demotes the matmul; ``010_split_demoted`` materializes the softmax-prob A cone + symbolic-K gemm."""
-    from deplodock.compiler.ir.frontend.ir import SoftmaxOp  # noqa: PLC0415
+    from emmy.compiler.ir.frontend.ir import SoftmaxOp  # noqa: PLC0415
 
     s = Dim("seq_len")
     g = Graph()
@@ -1261,7 +1261,7 @@ def test_masked_symbolic_m_structure(transport, monkeypatch):
     stages the A operand with ``cp.async.bulk.tensor`` (TMA zero-fills the masked overhang)."""
     knobs = _CP_KNOBS if transport == "cp" else _TMA_KNOBS
     for k, v in knobs.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+        monkeypatch.setenv(f"EMMY_{k}", v)
     lowered = Pipeline.build(CUDA_PASSES).run(_symbolic_m_graph(), ctx=Context(compute_capability=(12, 0)))
     kop = lowered.nodes["o"].op
     assert mma_atom(kop.knobs) == "mma_m16n8k16_f16"
@@ -1287,7 +1287,7 @@ def test_batched_symbolic_mk_reaches_warp(monkeypatch):
     """The batched masked-M + masked-K P@V consumer must reach the mma.sync tier (the
     ``classify_matmul_operands`` batch-aware B test), not stay a LoopOp."""
     for k, v in _CP_KNOBS.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+        monkeypatch.setenv(f"EMMY_{k}", v)
     lowered = Pipeline.build(CUDA_PASSES).run(_batched_symbolic_mk_graph(), ctx=Context(compute_capability=(12, 0)))
     kop = lowered.nodes["o"].op
     assert mma_atom(kop.knobs) == "mma_m16n8k16_f16", "batched symbolic M+K matmul must reach the warp tier"
@@ -1300,7 +1300,7 @@ def test_transposed_b_symbolic_k_zero_fills(monkeypatch):
     """A warp-tier A @ Bᵀ with symbolic K (transposed-B, K contiguous) emits the (n,k)-swapped
     K-zero-fill helper — K is summed by the mma, so the straddling final K tile must read +0.0
     past ``seq_len``, not a duplicate. (Accuracy at straddling sizes: ``symbolic_k_trans`` below.)"""
-    monkeypatch.setenv("DEPLODOCK_TILE", _MASK_WARP)
+    monkeypatch.setenv("EMMY_TILE", _MASK_WARP)
     lowered = Pipeline.build(CUDA_PASSES).run(_mma_symbolic_k_graph(64, 32, trans=True), ctx=Context(compute_capability=(12, 0)))
     kop = lowered.nodes["c"].op
     src = kop.kernel_source
@@ -1310,7 +1310,7 @@ def test_transposed_b_symbolic_k_zero_fills(monkeypatch):
 
 # (label, env, seqs, make). ``make(seq)`` builds (graph, feed, want) for one off-hint runtime
 # size; the driver compiles once per case and runs at each straddling size. ``env`` is the full
-# ``DEPLODOCK_*`` pin set (some cases route to the scalar tier with no WARP pin).
+# ``EMMY_*`` pin set (some cases route to the scalar tier with no WARP pin).
 
 
 def _make_symbolic_m(seq):
@@ -1427,13 +1427,13 @@ def test_masked_symbolic_accuracy(label, seq, monkeypatch):
     including the straddling cases (1, 31, 130, 700 are not tile-divisor multiples), which exercise
     the masked-M row guard, the masked-N column store, the zero-filled partial-K slab, the demoted
     B-cone overhang, and the TMA-staged P@V — each fed as a synthetic standalone graph."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     env, delenv, _seqs, make = _MASKED_CASES[label]
     for k, v in env.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+        monkeypatch.setenv(f"EMMY_{k}", v)
     for k in delenv:
-        monkeypatch.delenv(f"DEPLODOCK_{k}", raising=False)
+        monkeypatch.delenv(f"EMMY_{k}", raising=False)
 
     graph, feed, want = make(seq)
     be = CudaBackend()

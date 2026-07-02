@@ -1,0 +1,254 @@
+gpu_name: NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition
+compute_cap: [12, 0]
+configs:
+  - kernel: matmul
+    name: square.512
+    M: 512
+    N: 512
+    K: 512
+    knobs: {TILE: 'n16x8/f2x6', STAGE: 'd2/tma/ring'}
+    emmy_us: 11.0
+    cublas_us: 12.6
+  - kernel: matmul
+    name: square.1024
+    M: 1024
+    N: 1024
+    K: 1024
+    knobs: {TILE: 'n16x16/f4x6', STAGE: 'd4/tma/ring'}
+    emmy_us: 49.2
+    cublas_us: 55.6
+  - kernel: matmul
+    name: square.2048
+    M: 2048
+    N: 2048
+    K: 2048
+    knobs: {TILE: 'n32x16/f4x12', STAGE: 'd2/tma/ring'}
+    emmy_us: 357.6
+    cublas_us: 324.8
+  - kernel: matmul
+    name: square.4096
+    M: 4096
+    N: 4096
+    K: 4096
+    knobs: {TILE: 'n32x16/f4x6', STAGE: 'd3/tma/ring'}
+    emmy_us: 3021.4
+    cublas_us: 2426.0
+  - kernel: matmul
+    name: square.512.fp16
+    M: 512
+    N: 512
+    K: 512
+    dtype: fp16
+    knobs: {TILE: 'a:mma_m16n8k16_f16/w2x2/f2x2/k4', STAGE: 'd3/tma/ring'}
+    emmy_us: 3.8
+    cublas_us: 6.1
+  - kernel: matmul
+    name: square.512.fp16
+    M: 512
+    N: 512
+    K: 512
+    dtype: fp16
+    knobs: {TILE: 'a:mma_m16n8k16_f16/w1x4/f2x2/k4', STAGE: 'd2/tma/ring'}
+    emmy_us: 3.7
+    cublas_us: 6.1
+  - kernel: matmul
+    name: square.1024.fp16
+    M: 1024
+    N: 1024
+    K: 1024
+    dtype: fp16
+    knobs: {TILE: 'a:mma_m16n8k16_f16/w1x4/f4x2/k2', STAGE: 'd4/tma/ring'}
+    emmy_us: 13.9
+    cublas_us: 12.5
+  - kernel: matmul
+    name: square.2048.fp16
+    M: 2048
+    N: 2048
+    K: 2048
+    dtype: fp16
+    knobs: {TILE: 'a:mma_m16n8k16_f16/w4x2/f2x4/k2', STAGE: 'd2/tma/ring'}
+    emmy_us: 78.6
+    cublas_us: 69.9
+  - kernel: matmul
+    name: square.4096.fp16
+    M: 4096
+    N: 4096
+    K: 4096
+    dtype: fp16
+    knobs: {TILE: 'a:mma_m16n8k16_f16/w8x2/f2x8/k4', STAGE: 'd2/tma/ring'}
+    emmy_us: 515.9
+    cublas_us: 467.2
+  - kernel: matmul
+    name: qwen3_06b.q_proj.s32
+    M: 32
+    N: 2048
+    K: 1024
+    knobs: {TILE: 'n16x8/f2x4', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
+    emmy_us: 7.8
+    cublas_us: 8.7
+  - kernel: matmul
+    name: qwen3_06b.kv_proj.s32
+    M: 32
+    N: 1024
+    K: 1024
+    knobs: {TILE: 'n16x8/f2x2', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
+    emmy_us: 6.2
+    cublas_us: 8.5
+  - kernel: matmul
+    name: qwen3_06b.o_proj.s32
+    M: 32
+    N: 1024
+    K: 2048
+    knobs: {TILE: 'n16x8/f2x2', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
+    emmy_us: 10.0
+    cublas_us: 10.3
+  - kernel: matmul
+    name: qwen3_06b.gate_up_proj.s32
+    M: 32
+    N: 3072
+    K: 1024
+    knobs: {TILE: 'n16x8/f2x4', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
+    emmy_us: 11.6
+    cublas_us: 12.6
+  - kernel: matmul
+    name: qwen3_06b.down_proj.s32
+    M: 32
+    N: 1024
+    K: 3072
+    knobs: {TILE: 'n16x8/f2x2', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
+    emmy_us: 13.8
+    cublas_us: 14.4
+  - kernel: matmul
+    name: qwen3_06b.q_proj.s128
+    M: 128
+    N: 2048
+    K: 1024
+    knobs: {TILE: 'n16x8/f2x4', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
+    emmy_us: 18.7
+    cublas_us: 19.7
+  - kernel: matmul
+    name: qwen3_06b.kv_proj.s128
+    M: 128
+    N: 1024
+    K: 1024
+    knobs: {TILE: 'n16x8/f2x4', STAGE: 'd2/tma/ring'}
+    emmy_us: 12.1
+    cublas_us: 14.5
+  - kernel: matmul
+    name: qwen3_06b.o_proj.s128
+    M: 128
+    N: 1024
+    K: 2048
+    knobs: {TILE: 'n32x8/f2x4', REDUCE: 'g2a', STAGE: 'd4/tma/ring'}
+    emmy_us: 20.9
+    cublas_us: 22.6
+  - kernel: matmul
+    name: qwen3_06b.gate_up_proj.s128
+    M: 128
+    N: 3072
+    K: 1024
+    knobs: {TILE: 'n16x8/f2x4', STAGE: 'd2/tma/ring'}
+    emmy_us: 30.9
+    cublas_us: 26.4
+  - kernel: matmul
+    name: qwen3_06b.down_proj.s128
+    M: 128
+    N: 1024
+    K: 3072
+    knobs: {TILE: 'n16x16/f2x4', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
+    emmy_us: 30.0
+    cublas_us: 31.1
+  - kernel: matmul
+    name: qwen3_06b.q_proj.s512
+    M: 512
+    N: 2048
+    K: 1024
+    knobs: {TILE: 'n16x8/f4x6', STAGE: 'd3/tma/ring'}
+    emmy_us: 50.5
+    cublas_us: 55.4
+  - kernel: matmul
+    name: qwen3_06b.kv_proj.s512
+    M: 512
+    N: 1024
+    K: 1024
+    knobs: {TILE: 'n32x8/f4x6', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
+    emmy_us: 30.3
+    cublas_us: 39.5
+  - kernel: matmul
+    name: qwen3_06b.o_proj.s512
+    M: 512
+    N: 1024
+    K: 2048
+    knobs: {TILE: 'n16x8/f4x6', STAGE: 'd2/tma/ring'}
+    emmy_us: 66.3
+    cublas_us: 68.6
+  - kernel: matmul
+    name: qwen3_06b.gate_up_proj.s512
+    M: 512
+    N: 3072
+    K: 1024
+    knobs: {TILE: 'n32x16/f4x6', STAGE: 'd3/tma/ring'}
+    emmy_us: 85.1
+    cublas_us: 81.3
+  - kernel: matmul
+    name: qwen3_06b.down_proj.s512
+    M: 512
+    N: 1024
+    K: 3072
+    knobs: {TILE: 'n16x8/f4x6', STAGE: 'd2/tma/ring'}
+    emmy_us: 97.8
+    cublas_us: 92.0
+  - kernel: matmul
+    name: square.512.dynM
+    M: 512
+    N: 512
+    K: 512
+    dynamic: {seq_len: {input: x0, axis: 0}}
+    knobs: {TILE: 'n16x8/f2x6', REDUCE: 'g2a', STAGE: 'd4/tma/ring'}
+    emmy_us: 10.2
+    cublas_us: 12.6
+  - kernel: matmul
+    name: qwen3_06b.q_proj.s512.dynM
+    M: 512
+    N: 2048
+    K: 1024
+    dynamic: {seq_len: {input: x0, axis: 0}}
+    knobs: {TILE: 'n32x8/f4x6', STAGE: 'd2/tma/ring'}
+    emmy_us: 55.2
+    cublas_us: 55.3
+  - kernel: matmul
+    name: qwen3_06b.kv_proj.s512.dynM
+    M: 512
+    N: 1024
+    K: 1024
+    dynamic: {seq_len: {input: x0, axis: 0}}
+    knobs: {TILE: 'n32x8/f4x6', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
+    emmy_us: 29.8
+    cublas_us: 39.5
+  - kernel: matmul
+    name: qwen3_06b.o_proj.s512.dynM
+    M: 512
+    N: 1024
+    K: 2048
+    dynamic: {seq_len: {input: x0, axis: 0}}
+    knobs: {TILE: 'n32x8/f4x6', REDUCE: 'g2a', STAGE: 'd3/tma/ring'}
+    emmy_us: 53.7
+    cublas_us: 68.4
+  - kernel: matmul
+    name: qwen3_06b.gate_up_proj.s512.dynM
+    M: 512
+    N: 3072
+    K: 1024
+    dynamic: {seq_len: {input: x0, axis: 0}}
+    knobs: {TILE: 'n32x8/f4x6', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
+    emmy_us: 83.9
+    cublas_us: 80.9
+  - kernel: matmul
+    name: qwen3_06b.down_proj.s512.dynM
+    M: 512
+    N: 1024
+    K: 3072
+    dynamic: {seq_len: {input: x0, axis: 0}}
+    knobs: {TILE: 'n32x8/f4x6', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
+    emmy_us: 78.3
+    cublas_us: 92.1

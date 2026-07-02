@@ -59,8 +59,8 @@ class _Masked(torch.nn.Module):
 
 def _trace(module, args, dynamic_shapes=None):
     """Trace + compile ``module``; return ``(backend, compiled, graph, kernel_node_ids)``."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
-    from deplodock.compiler.trace.torch import trace_module  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.trace.torch import trace_module  # noqa: PLC0415
 
     graph = trace_module(module.cpu(), args, dynamic_shapes=dynamic_shapes)
     backend = CudaBackend()
@@ -70,11 +70,11 @@ def _trace(module, args, dynamic_shapes=None):
 
 
 def _max_diff(backend, compiled, feed: dict, ref_fn) -> float:
-    """Run deplodock + the torch eager ``ref_fn`` under one GPU-lock window; return max|Δ|."""
+    """Run emmy + the torch eager ``ref_fn`` under one GPU-lock window; return max|Δ|."""
     run_result, eager = backend.run(compiled, input_data=feed, pre_run=ref_fn)
     got = list(run_result.outputs.values())[0].flatten()
     assert got.shape == eager.shape
-    assert not np.any(np.isnan(got)), "deplodock output has NaN"
+    assert not np.any(np.isnan(got)), "emmy output has NaN"
     return float(np.max(np.abs(got - eager)))
 
 
@@ -194,10 +194,10 @@ def test_scalar_flash_dynamic_matches_torch(monkeypatch, variant):
 @requires_cuda
 @pytest.mark.parametrize("bk", [2, 4])
 def test_scalar_flash_kv_tile_matches_torch(monkeypatch, bk):
-    """KV tiling: a ``DEPLODOCK_BK`` pin re-brackets the streaming reduce ``S_k → S_k/BK · BK``
+    """KV tiling: a ``EMMY_BK`` pin re-brackets the streaming reduce ``S_k → S_k/BK · BK``
     (serial within the tile). The fused flash kernel must still fuse to one kernel and match torch.
     ``S=32`` / ``D=16`` are divisible by both 2 and 4, so the pin is honored."""
-    monkeypatch.setenv("DEPLODOCK_BK", str(bk))
+    monkeypatch.setenv("EMMY_BK", str(bk))
     torch.manual_seed(0)
     q, k, v = (torch.randn(2, 3, 32, 16) for _ in range(3))
     backend, compiled, _graph, kernels = _trace(_Sdpa(), (q, k, v))
@@ -532,7 +532,7 @@ def test_cooperative_flash_matches_torch(monkeypatch, br, B, H, S, D):
     """A cooperative-KV flash (BR>1) fuses to one kernel carrying the monoid cross-thread combine
     (``__shfl_xor_sync`` for BR≤32, a per-component smem tree for BR>32) and matches torch SDPA —
     the KV parallelization is accuracy-preserving (the LSE monoid is associative + commutative)."""
-    monkeypatch.setenv("DEPLODOCK_REDUCE", f"b{br}")
+    monkeypatch.setenv("EMMY_REDUCE", f"b{br}")
     torch.manual_seed(0)
     q, k, v = (torch.randn(B, H, S, D) for _ in range(3))
     backend, compiled, _graph, kernels = _trace(_Sdpa(), (q, k, v))
@@ -649,7 +649,7 @@ def test_fused_tensorcore_flash_reference_matches_torch(S):
     C-fragment row reduction, the C→A handoff) is exercised here."""
     import cupy as cp  # noqa: PLC0415
 
-    from deplodock.compiler.backend.cuda import nvcc  # noqa: PLC0415
+    from emmy.compiler.backend.cuda import nvcc  # noqa: PLC0415
 
     fn = nvcc.load_function(_KERNEL, "fa2", "", uses_tma=False)
     torch.manual_seed(S)
@@ -681,16 +681,16 @@ def _chain_tile_pins(monkeypatch):
     The tile is irrelevant to the accuracy checks (legacy env pins route through the ingest mapper)."""
     torch.manual_seed(42)
     for k, v in (("BN", "16"), ("BM", "8"), ("FN", "2"), ("FM", "2"), ("BK", "8"), ("BR", "4")):
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+        monkeypatch.setenv(f"EMMY_{k}", v)
 
 
 def _run_module_with_eager(module: torch.nn.Module, args: tuple, inputs_by_name: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-    """Trace + compile ``module``, then run the deplodock kernels and the torch eager reference under
-    one ``backend.run`` GPU-lock window via ``pre_run``. Returns ``(deplodock_flat, eager_flat)``."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
-    from deplodock.compiler.ir.base import ConstantOp  # noqa: PLC0415
-    from deplodock.compiler.loader.binder import apply_load_ops  # noqa: PLC0415
-    from deplodock.compiler.trace.torch import trace_module  # noqa: PLC0415
+    """Trace + compile ``module``, then run the emmy kernels and the torch eager reference under
+    one ``backend.run`` GPU-lock window via ``pre_run``. Returns ``(emmy_flat, eager_flat)``."""
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.ir.base import ConstantOp  # noqa: PLC0415
+    from emmy.compiler.loader.binder import apply_load_ops  # noqa: PLC0415
+    from emmy.compiler.trace.torch import trace_module  # noqa: PLC0415
 
     graph = trace_module(module.cpu(), args)
     backend = CudaBackend()
@@ -732,11 +732,11 @@ def _run_module_with_eager(module: torch.nn.Module, args: tuple, inputs_by_name:
     return dpd, eager
 
 
-def _assert_close(deplodock: np.ndarray, eager: np.ndarray, threshold: float = 1e-4) -> None:
-    assert deplodock.shape == eager.shape, f"shape: {deplodock.shape} vs {eager.shape}"
-    assert not np.any(np.isnan(deplodock)), "deplodock output has NaN"
-    max_diff = float(np.max(np.abs(deplodock - eager)))
-    mean_diff = float(np.mean(np.abs(deplodock - eager)))
+def _assert_close(emmy: np.ndarray, eager: np.ndarray, threshold: float = 1e-4) -> None:
+    assert emmy.shape == eager.shape, f"shape: {emmy.shape} vs {eager.shape}"
+    assert not np.any(np.isnan(emmy)), "emmy output has NaN"
+    max_diff = float(np.max(np.abs(emmy - eager)))
+    mean_diff = float(np.mean(np.abs(emmy - eager)))
     max_eager = float(np.max(np.abs(eager)))
     assert max_diff < threshold, f"max_diff={max_diff:.6f} >= {threshold} (mean={mean_diff:.6f}, max_eager={max_eager:.3f})"
 
@@ -818,7 +818,7 @@ def test_sdpa_explicit_additive_mask(_chain_tile_pins, n_heads: int, seq_len: in
 
 
 def _run_self_attn_tinyllama(seq_len: int, threshold: float = 1e-4) -> None:
-    """Run TinyLlama's ``LlamaAttention`` sub-module at ``seq_len`` and verify deplodock matches
+    """Run TinyLlama's ``LlamaAttention`` sub-module at ``seq_len`` and verify emmy matches
     eager (forced MATH SDPA backend) within ``threshold``."""
     from transformers import AutoConfig, AutoModelForCausalLM  # noqa: PLC0415
 
@@ -834,10 +834,10 @@ def _run_self_attn_tinyllama(seq_len: int, threshold: float = 1e-4) -> None:
     cos = torch.randn(1, 1, seq_len, head_dim)
     sin = torch.randn(1, 1, seq_len, head_dim)
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
-    from deplodock.compiler.ir.base import ConstantOp  # noqa: PLC0415
-    from deplodock.compiler.loader.binder import apply_load_ops  # noqa: PLC0415
-    from deplodock.compiler.trace.torch import trace_module  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.ir.base import ConstantOp  # noqa: PLC0415
+    from emmy.compiler.loader.binder import apply_load_ops  # noqa: PLC0415
+    from emmy.compiler.trace.torch import trace_module  # noqa: PLC0415
 
     attn_cpu = attn.cpu()
     graph = trace_module(attn_cpu, (x,), kwargs={"position_embeddings": (cos, sin)})
@@ -872,9 +872,9 @@ def _run_self_attn_tinyllama(seq_len: int, threshold: float = 1e-4) -> None:
     x_cuda, cos_cuda, sin_cuda = x.cuda(), cos.cuda(), sin.cuda()
 
     def eager_pre_run() -> np.ndarray:
-        # Force the math (naive) SDPA backend so eager and deplodock compare the same algorithm —
+        # Force the math (naive) SDPA backend so eager and emmy compare the same algorithm —
         # flash re-orders FMAs and would drift O(0.5 × max_eager) at seq ≥ 512. Runs inside
-        # ``backend.run``'s GPU lock so eager + deplodock share one uninterrupted GPU window.
+        # ``backend.run``'s GPU lock so eager + emmy share one uninterrupted GPU window.
         with torch.no_grad(), torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
             out = attn_cuda(x_cuda, position_embeddings=(cos_cuda, sin_cuda))[0]
         return out.cpu().flatten().numpy()

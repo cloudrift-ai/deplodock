@@ -13,12 +13,12 @@ from __future__ import annotations
 
 import types
 
-import deplodock.commands.run as run_mod
-import deplodock.commands.tune as tune_mod
-import deplodock.compiler.backend.cuda.backend as backend_mod
-import deplodock.compiler.backend.cuda.program as program_mod
-from deplodock import config
-from deplodock.compiler.backend.cuda.program import HungKernelError
+import emmy.commands.run as run_mod
+import emmy.commands.tune as tune_mod
+import emmy.compiler.backend.cuda.backend as backend_mod
+import emmy.compiler.backend.cuda.program as program_mod
+from emmy import config
+from emmy.compiler.backend.cuda.program import HungKernelError
 
 
 class _DummyBackend:
@@ -34,7 +34,7 @@ def _args() -> types.SimpleNamespace:
         warmup=1,
         iters=1,
         seed=0,
-        bench_backends="deplodock",
+        bench_backends="emmy",
         code=None,
         input="some/model",
         layer=0,
@@ -50,7 +50,7 @@ def _patch_common(monkeypatch, *, compare_raises: Exception | None) -> list[bool
     async def _fake_compare(**_kw):
         if compare_raises is not None:
             raise compare_raises
-        return {"Deplodock": 1.0}, object(), True, False  # (results, bench, torch_available, captured)
+        return {"Emmy": 1.0}, object(), True, False  # (results, bench, torch_available, captured)
 
     def _fake_per_kernel(*_a, **_k):
         per_kernel_ran[0] = True

@@ -1,12 +1,12 @@
-# Qwen3-Embedding-8B: stock vLLM pooling vs vLLM + deplodock compiled-kernel plugin
-# (deplodock/serving — same OpenAI /v1/embeddings shell, different kernels).
+# Qwen3-Embedding-8B: stock vLLM pooling vs vLLM + emmy compiled-kernel plugin
+# (emmy/serving — same OpenAI /v1/embeddings shell, different kernels).
 #
 # context_length is pinned to 4096 on BOTH engines for an apples-to-apples comparison —
-# 4096 is deplodock's dynamic-dim max (compiler/trace/dynamic.py DYNAMIC_DIM_MAX); the
+# 4096 is emmy's dynamic-dim max (compiler/trace/dynamic.py DYNAMIC_DIM_MAX); the
 # model natively supports 32k.
 #
-# The deplodock variant compiles the whole model at engine start (~3 min first boot,
-# faster after — DEPLODOCK_CUBIN_CACHE persists compiled cubins on the model volume).
+# The emmy variant compiles the whole model at engine start (~3 min first boot,
+# faster after — EMMY_CUBIN_CACHE persists compiled cubins on the model volume).
 # Stock vLLM ignores that env var, so it sits at the base level for both variants.
 model:
   huggingface: "Qwen/Qwen3-Embedding-8B"
@@ -16,7 +16,7 @@ engine:
   llm:
     tensor_parallel_size: 1
     pipeline_parallel_size: 1
-    # 8B fp16 weights ≈ 16 GB. On the 24 GB 4090 the deplodock variant's cupy-held
+    # 8B fp16 weights ≈ 16 GB. On the 24 GB 4090 the emmy variant's cupy-held
     # weights are non-torch memory that vLLM's profiler subtracts from this budget —
     # utilization must clear (weights + overhead)/24 with headroom while leaving
     # vLLM a positive remainder (the attention-free plugin needs no KV cache).
@@ -25,7 +25,7 @@ engine:
     max_concurrent_requests: 32
     vllm:
       extra_env:
-        DEPLODOCK_CUBIN_CACHE: "/hf_models/deplodock-cubins"
+        EMMY_CUBIN_CACHE: "/hf_models/emmy-cubins"
 
 benchmark:
   max_concurrency: 32
@@ -43,10 +43,11 @@ matrices:
     zip:
       engine.llm.vllm.image:
         - "vllm/vllm-openai:v0.22.1"
-        - "cloudriftai/vllm-deplodock:0.22.1-8c7b0e9b"
+        # emmy compiled-kernel serving image (registers EmmyEmbedModel)
+        - "cloudriftai/vllm-emmy:0.22.1-90c70d5e"
       engine.llm.vllm.extra_args:
         - "--runner pooling"
-        - "--runner pooling --enforce-eager --hf-overrides '{\"architectures\":[\"DeplodockEmbedModel\"]}'"
+        - "--runner pooling --enforce-eager --hf-overrides '{\"architectures\":[\"EmmyEmbedModel\"]}'"
 
 aggregate:
   run: |

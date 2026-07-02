@@ -23,12 +23,12 @@ def rmsnorm_setup():
     pytest.importorskip("cupy")
     import torch
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     m = torch.nn.RMSNorm(256)
     with torch.no_grad():
         m.weight.copy_(torch.rand_like(m.weight) + 0.5)
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.trace.torch import trace_module
 
     seq = torch.export.Dim("seq_len", min=5, max=4096)
     graph = trace_module(m, (torch.randn(1, 32, 256),), dynamic_shapes={"x": {1: seq}})
@@ -49,8 +49,8 @@ def _inputs(m, s: int) -> tuple[dict[str, np.ndarray], np.ndarray]:
 def test_rebind_runs_at_new_seq_lens(rmsnorm_setup):
     """Build at S=32, rebind through S=64 and S=8 — outputs track the new
     runtime shape and match torch eager at every size."""
-    from deplodock.compiler.backend.cuda.program import CompiledProgram
-    from deplodock.compiler.backend.gpu_lock import gpu_lock
+    from emmy.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.gpu_lock import gpu_lock
 
     compiled, m = rmsnorm_setup
     with gpu_lock():
@@ -72,8 +72,8 @@ def test_rebind_runs_at_new_seq_lens(rmsnorm_setup):
 def test_rebind_same_shape_reuploads_in_place(rmsnorm_setup):
     """Same seq_len, new contents: device arrays are reused (no realloc) and
     the fresh values flow through."""
-    from deplodock.compiler.backend.cuda.program import CompiledProgram
-    from deplodock.compiler.backend.gpu_lock import gpu_lock
+    from emmy.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.gpu_lock import gpu_lock
 
     compiled, m = rmsnorm_setup
     with gpu_lock():
@@ -96,8 +96,8 @@ def test_rebind_same_shape_reuploads_in_place(rmsnorm_setup):
 def test_rebind_keeps_weight_array_and_drops_graphs(rmsnorm_setup):
     """Weights (static-shaped, un-supplied) keep their device array across a
     seq_len change; captured CUDA graphs are invalidated."""
-    from deplodock.compiler.backend.cuda.program import CompiledProgram
-    from deplodock.compiler.backend.gpu_lock import gpu_lock
+    from emmy.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.gpu_lock import gpu_lock
 
     compiled, m = rmsnorm_setup
     with gpu_lock():

@@ -8,10 +8,10 @@ gates 013/015 care about.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop
-from deplodock.compiler.ir.stmt.body import Body
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.stmt import Accum, Assign, Load, Loop
+from emmy.compiler.ir.stmt.body import Body
 
 
 def _ld(name: str, src: str, *idx: str) -> Load:

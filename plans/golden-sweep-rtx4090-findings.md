@@ -1,8 +1,8 @@
 # Golden sweep findings — RTX 4090 (sm_89), 2026-06-19
 
 - GPU: NVIDIA GeForce RTX 4090, sm_89, CUDA 12.9 (`nvcc` at `/usr/local/cuda`), local single-host sweep.
-- Sweep: `deplodock tune --dataset golden --clean` (29 shapes, ~102 min compute) → per-shape A/B
-  `deplodock run --bench --golden NAME` (29 shapes, ~6 min) → confirmation re-runs of the win candidates (~12 min).
+- Sweep: `emmy tune --dataset golden --clean` (29 shapes, ~102 min compute) → per-shape A/B
+  `emmy run --bench --golden NAME` (29 shapes, ~6 min) → confirmation re-runs of the win candidates (~12 min).
   Logs under the gitignored `_tune/golden-sweep-rtx4090/` (`tune.log`, `ab/`, `ab2/`).
 - Branch: `feature/golden-sweep-rtx4090`.
 - **Category tally: 12 replaced / 0 added / 11 unchanged / 6 worse (left).** All A/B numbers are -O3 `run --bench`,
@@ -75,10 +75,10 @@ two tiny s32 shapes — the shapes where the analytic geometry terms extrapolate
 | qwen3_06b.down_proj.s512.dynM    |      95.3 |      91.8 |  1.04 |     119.4 |      0.80 | unchanged (noise)                |
 
 `vs cuBLAS` = greedy µs / recorded `cublas_us` (torch eager: true-fp32 SGEMM with `allow_tf32=False`, or HGEMM for
-`*.fp16`), so **>1.0 = deplodock is slower than PyTorch** — the absolute gap the relative greedy-vs-golden ratio hides.
+`*.fp16`), so **>1.0 = emmy is slower than PyTorch** — the absolute gap the relative greedy-vs-golden ratio hides.
 The worst cuBLAS losers are the large/regular GEMMs: `square.4096` 1.71×, `square.1024` 1.63×, `square.1024.fp16`
 1.62×, `square.2048.fp16` 1.54×, `down_proj.s32` 1.53×. Note the fp16 squares win their golden A/B 3× yet still trail
-cuBLAS HGEMM 1.5–1.6× (the win was vs the stale scalar golden, not vs PyTorch). deplodock only *beats* cuBLAS on six
+cuBLAS HGEMM 1.5–1.6× (the win was vs the stale scalar golden, not vs PyTorch). emmy only *beats* cuBLAS on six
 rectangular projections (`down_proj.s512` 0.70×, `down_proj.s512.dynM` 0.80×, `o_proj.s512` 0.82×, `kv_proj.s512`
 0.88×, `q_proj.s32` 0.79×, `kv_proj.s32` 0.91×). The cuBLAS-loser shapes that are *also* golden-unchanged/worse are the
 real headroom; the `_W_A` refit (Findings 1/4) targets the worst of them.
@@ -119,9 +119,9 @@ couldn't see it), or the partition fork didn't offer it at the greedy site. `gat
 knob diffs `BN/BK/FM`) is the same family, milder.
 
 **Recommendation (P1):** check whether the golden config received an -O3 reservoir row during this tune (the
-`DEPLODOCK_O3_TOL` re-bench band) — if a measured-best leaf is missing from the reservoir, `evidence_pick` can't
+`EMMY_O3_TOL` re-bench band) — if a measured-best leaf is missing from the reservoir, `evidence_pick` can't
 deploy it. If the row exists but greedy still diverged, the gap is in the greedy partition-fork enumeration vs the
-reservoir key (`op_cache_key`); instrument `greedy_decide`'s `pick` path on this op. A faithful repro: `deplodock run
+reservoir key (`op_cache_key`); instrument `greedy_decide`'s `pick` path on this op. A faithful repro: `emmy run
 --bench --golden qwen3_06b.down_proj.s32 --ab "BM=8,BN=16,BK=64,FM=2,FN=2,SPLITK=2,RING=4"`.
 
 ## Finding 3 — masked-tile `.dynM` family: greedy oversizes the tile by one notch (P2)
@@ -145,7 +145,7 @@ sm_89), at a tiny absolute (~1.4 µs). Folded into the Finding 1 `_W_A` refit; n
 
 ## Finding 5 — fp16 squares: we *do* use tensor cores, but the prior undersizes the warp tile (P1)
 
-Follow-up investigation into the deplodock-vs-cuBLAS fp16 gap ("are we not able to use MMA there?"). Two structural
+Follow-up investigation into the emmy-vs-cuBLAS fp16 gap ("are we not able to use MMA there?"). Two structural
 facts first: (a) the atom registry holds only `mma_m16n8k16_f16` / `_bf16` — **there is no TF32 atom**, so fp32 matmuls
 have no tensor-core path at all (the fp32 squares run scalar CUDA-core FMA against true-SGEMM, by design); (b)
 **warp-specialization requires a TMA `StageBundle`** (`085_warp_specialize._eligible` → "no TMA StageBundle"), and TMA

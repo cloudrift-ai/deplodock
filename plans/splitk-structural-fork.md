@@ -26,7 +26,7 @@ Deviations from the plan below:
 ## Context
 
 Split-K partitions a matmul's contraction axis `k` across CTAs: each block contracts a slice of `k`, then the
-partial output tiles are summed. Today deplodock has *scalar-only* split-K riding a residual path, and **mma split-K
+partial output tiles are summed. Today emmy has *scalar-only* split-K riding a residual path, and **mma split-K
 does not actually work**. This plan makes mma split-K work for the first time by representing it structurally and
 introducing it through a schedule fork, then retires the residual path.
 
@@ -72,11 +72,11 @@ partial, the `Reduction` sums partials across `ksplit`; every original `k` eleme
 
 ## Ground truth (verified against the code — corrects the original framing)
 
-1. `030_split.py` is a **tile** pass (`deplodock/compiler/pipeline/passes/lowering/tile/030_split.py`), runs before
+1. `030_split.py` is a **tile** pass (`emmy/compiler/pipeline/passes/lowering/tile/030_split.py`), runs before
    the kernel pass; materialize dispatch is `010_materialize.py:301` (`isinstance(tile.op, Contraction)` → `factorize`).
 2. The split-K codec is **`g<n>[a|k]`** (`ir/tile/schedule.py` `_REDUCE_SCHEMA`), `a|k` = atomic|kernel finalize.
-   Goldens use it bare, e.g. `rtxpro6000_sm120.yaml` `REDUCE: 'g2a'`. The `s2/c2a` spelling and `DEPLODOCK_SPLIT` /
-   `DEPLODOCK_ATOM` env vars are **dead** (no consumer; `parse("s2/c2a")` throws, swallowed to `""`).
+   Goldens use it bare, e.g. `rtxpro6000_sm120.yaml` `REDUCE: 'g2a'`. The `s2/c2a` spelling and `EMMY_SPLIT` /
+   `EMMY_ATOM` env vars are **dead** (no consumer; `parse("s2/c2a")` throws, swallowed to `""`).
 3. `test_mma_splitk_finalize` is **stale/vacuous**: the atomic arm passes as a plain scalar single-CTA matmul; the
    deferred arm is xfail. It does not exercise mma or split-K today.
 4. What works today: **scalar-tile** split-K via the residual `Map` (`_tile_option` keeps the `Map` and stamps
@@ -151,8 +151,8 @@ holds (030_split strips the split first).
 4. `030_split`: delete the residual lowered-loop-nest slicing path for contractions (kept only for plain-sum split).
 5. Verify no other `needs_split` / `.cta` / `.finalize` consumer breaks (all read through `reduce_plan`, which now
    resolves to the node).
-6. Rewrite `test_mma_splitk_finalize` to drive the fork (`DEPLODOCK_TILE=a:mma_m16n8k16_f16/w2x2/f2x2/k2` +
-   `DEPLODOCK_REDUCE=g2a`/`g2k`), keep the `mma.sync…` present / `atomicAdd` absent assertions, and remove the
+6. Rewrite `test_mma_splitk_finalize` to drive the fork (`EMMY_TILE=a:mma_m16n8k16_f16/w2x2/f2x2/k2` +
+   `EMMY_REDUCE=g2a`/`g2k`), keep the `mma.sync…` present / `atomicAdd` absent assertions, and remove the
    `[deferred]` entry from `tests/xfail_registry.py` (it XPASSes once the workspace retarget lands).
 
 ### E. Tests
@@ -195,11 +195,11 @@ holds (030_split strips the split first).
 
 ## Critical files
 
-- `deplodock/compiler/pipeline/passes/lowering/tile/_schedule.py` — the fork (A), axis factoring (B), residual
+- `emmy/compiler/pipeline/passes/lowering/tile/_schedule.py` — the fork (A), axis factoring (B), residual
   retirement (D).
-- `deplodock/compiler/pipeline/passes/lowering/tile/030_split.py` — structural partial → mma, reused finalize (C).
-- `deplodock/compiler/ir/tile/structural.py`, `ir/tile/ops.py` — `Reduction`/`Contraction` build + dispatch.
-- `deplodock/compiler/ir/stmt/leaves.py` (`as_carrier`), `ir/stmt/algebra.py` (`as_state_merge`) — carrier reuse.
+- `emmy/compiler/pipeline/passes/lowering/tile/030_split.py` — structural partial → mma, reused finalize (C).
+- `emmy/compiler/ir/tile/structural.py`, `ir/tile/ops.py` — `Reduction`/`Contraction` build + dispatch.
+- `emmy/compiler/ir/stmt/leaves.py` (`as_carrier`), `ir/stmt/algebra.py` (`as_state_merge`) — carrier reuse.
 - `tests/compiler/e2e/test_matmul_coverage.py`, `tests/compiler/ir/tile/test_structural_reduction.py`,
   `tests/compiler/pipeline/test_knob.py`, `tests/xfail_registry.py` — tests.
 

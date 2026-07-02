@@ -6,7 +6,7 @@ description: Learn how to benchmark LLM models across GPU types and configuratio
 
 # Running Benchmarks
 
-Deplodock lets you run standardized benchmarks across different GPU types and model configurations,
+Emmy lets you run standardized benchmarks across different GPU types and model configurations,
 so you can find the best performance-to-cost ratio before committing to a deployment.
 
 ## Metrics

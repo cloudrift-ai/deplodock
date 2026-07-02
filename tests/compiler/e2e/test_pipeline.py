@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.backend.cuda.backend import CudaBackend
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.cuda import CudaOp
-from deplodock.compiler.ir.loop import Accum, LoopOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
+from emmy.compiler.backend.cuda.backend import CudaBackend
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.cuda import CudaOp
+from emmy.compiler.ir.loop import Accum, LoopOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
 
 from ..conftest import matmul_graph, requires_cuda
 

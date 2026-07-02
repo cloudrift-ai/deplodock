@@ -7,10 +7,10 @@ import json
 import numpy as np
 import pytest
 
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.frontend.ir import ReshapeOp, TransposeOp
-from deplodock.compiler.loader.binder import apply_load_ops, bind_constants
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import ConstantOp, InputOp
+from emmy.compiler.ir.frontend.ir import ReshapeOp, TransposeOp
+from emmy.compiler.loader.binder import apply_load_ops, bind_constants
 
 
 def test_apply_load_ops_empty_returns_source():
@@ -141,7 +141,7 @@ def test_safetensors_loader_roundtrip(tmp_path):
         node_id="p_b",
     )
 
-    from deplodock.compiler.loader.safetensors import load_constants_from_safetensors
+    from emmy.compiler.loader.safetensors import load_constants_from_safetensors
 
     out = load_constants_from_safetensors(g, str(tmp_path))
     np.testing.assert_array_equal(out["p_w"], weights["layer.weight"].T)
@@ -181,7 +181,7 @@ def test_safetensors_loader_sharded_index(tmp_path):
         node_id="p_b",
     )
 
-    from deplodock.compiler.loader.safetensors import load_constants_from_safetensors
+    from emmy.compiler.loader.safetensors import load_constants_from_safetensors
 
     out = load_constants_from_safetensors(g, str(tmp_path))
     np.testing.assert_array_equal(out["p_w"], np.full((2, 2), 1.0, dtype=np.float32))

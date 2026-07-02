@@ -1,6 +1,6 @@
 """``diagnostics.golden_deploy_perf`` — the no-rebench ``vs gold`` column for
-``deplodock eval prior``: per golden shape, the deployable (-O3) latency of the
-prior's predicted-best reservoir config over the golden's recorded ``deplodock_us``.
+``emmy eval prior``: per golden shape, the deployable (-O3) latency of the
+prior's predicted-best reservoir config over the golden's recorded ``emmy_us``.
 
 The load-bearing case is dtype separation: an fp32 square and its ``.fp16`` twin
 share (free-dim product, reduce extent), so the shape key MUST split on
@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.pipeline.search import golden as golden_mod
-from deplodock.compiler.pipeline.search.golden import goldens_by_name
-from deplodock.compiler.pipeline.search.prior import diagnostics
+from emmy.compiler.pipeline.search import golden as golden_mod
+from emmy.compiler.pipeline.search.golden import goldens_by_name
+from emmy.compiler.pipeline.search.prior import diagnostics
 
 
 @pytest.fixture(autouse=True)
@@ -62,8 +62,8 @@ def _row(free_prod, reduce_max, *, fp32, h_opt, latency):
 
 
 def test_dtype_separation_and_o3_filter():
-    g32 = goldens_by_name("square.512")[0].deplodock_us  # fp32 golden latency (-O3)
-    g16 = goldens_by_name("square.512.fp16")[0].deplodock_us
+    g32 = goldens_by_name("square.512")[0].emmy_us  # fp32 golden latency (-O3)
+    g16 = goldens_by_name("square.512.fp16")[0].emmy_us
     fp = 512 * 512  # both square.512 and .fp16 share (free_prod, reduce)
 
     prior = _FakePrior(
@@ -89,7 +89,7 @@ def test_shape_without_o3_is_omitted():
 
 
 def test_kernel_filter_restricts_shapes():
-    g32 = goldens_by_name("square.512")[0].deplodock_us
+    g32 = goldens_by_name("square.512")[0].emmy_us
     prior = _FakePrior([_row(512 * 512, 512, fp32=True, h_opt=3, latency=g32)])
     assert set(diagnostics.golden_deploy_perf(prior, "square.512")) <= {"square.512"}
 
@@ -98,7 +98,7 @@ def test_non_matmul_group_with_colliding_extents_is_excluded():
     """A reduce-shaped op group that happens to share a matmul golden's
     (free_prod, reduce_max, dtype) must not satisfy the join — the index admits
     only matmul-histogram groups (``_matmul_sig``)."""
-    g32 = goldens_by_name("square.512")[0].deplodock_us
+    g32 = goldens_by_name("square.512")[0].emmy_us
     knobs, latency = _row(512 * 512, 512, fp32=True, h_opt=3, latency=g32 * 0.1)
     knobs.pop("S_pw_multiply")  # no product feeding the reduce → not a matmul body
     assert "square.512" not in diagnostics.golden_deploy_perf(_FakePrior([(knobs, latency)]))

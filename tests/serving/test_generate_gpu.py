@@ -41,7 +41,7 @@ def test_generate_oracle_matches_eager_fp16():
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    from deplodock.commands.generate import _CompiledLM
+    from emmy.commands.generate import _CompiledLM
 
     # IMPORTANT: build_full_model_wrapper mutates the model in place (replaces rotary_emb
     # with _SlicedRotary, patches the causal-mask builder). Compare against an INDEPENDENT,
@@ -75,12 +75,12 @@ def test_slice_last_logits_lowers_cold():
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.backend.cuda.program import CompiledProgram
-    from deplodock.compiler.backend.gpu_lock import gpu_lock
-    from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
-    from deplodock.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.gpu_lock import gpu_lock
+    from emmy.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
+    from emmy.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
+    from emmy.compiler.trace.torch import trace_module
 
     model = _tiny_llama()
     s = 8
@@ -101,8 +101,8 @@ def test_generate_loop_runs_end_to_end():
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    from deplodock.commands.generate import _CompiledLM, generate
-    from deplodock.serving.sampling import Sampler
+    from emmy.commands.generate import _CompiledLM, generate
+    from emmy.serving.sampling import Sampler
 
     lm = _CompiledLM.from_model(_tiny_llama(), seq_len=8)
     out = generate(lm.logits, [1, 2, 3], max_new_tokens=5, eos_ids=None, sampler=Sampler())

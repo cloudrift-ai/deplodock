@@ -4,9 +4,9 @@
   passes renumbered into the `enumeration/` package, OVERHANG knob → per-role `S_masked_{m,n,k}` features, `pick_matmul`
   rebuilt over per-family offers). The previous (fourth) sweep ran on `main`.
 - **Ask:** *verify the analytic prior on this branch and re-tune if necessary*, plus the full golden sweep.
-- **Sweep:** `deplodock tune --dataset golden --clean` — 29 matmul targets (23 static + 6 `.dynM`) + the reduce/pointwise
+- **Sweep:** `emmy tune --dataset golden --clean` — 29 matmul targets (23 static + 6 `.dynM`) + the reduce/pointwise
   shapes, **~112 min wall** (4× the skill's ~30 min estimate — see Workflow notes).
-- **A/B:** `deplodock run --bench --golden NAME` per shape (greedy pick benched live beside each recorded golden, all at
+- **A/B:** `emmy run --bench --golden NAME` per shape (greedy pick benched live beside each recorded golden, all at
   -O3); table parsed by hand from the kernel rows (the prior sweep's `/tmp/harvest_goldens.py` is gone — Workflow notes).
 - **Tally — goldens: 0 replaced / 0 added / 34 left (validated).** Every clean-search greedy pick is **at or below** its
   recorded golden; the apparent wins (`down_proj.s32`, `o_proj.s32/.s128`, `o_proj/down_proj.s512.dynM`) are 7–9% vs the
@@ -18,9 +18,9 @@
 
 ## Per-shape outcome table
 
-All deplodock / golden numbers from the -O3 `run --bench` A/B. `ratio` = greedy ÷ **recorded** golden `deplodock_us`
+All emmy / golden numbers from the -O3 `run --bench` A/B. `ratio` = greedy ÷ **recorded** golden `emmy_us`
 (the stable reference; the live golden row swings ~10–13% and ran slow this session). `vs cuBLAS` = greedy ÷ eager
-(`>1.0` = deplodock slower than cuBLAS — the loser view). cuBLAS = the live `Eager PyTorch` row (true-fp32 SGEMM /
+(`>1.0` = emmy slower than cuBLAS — the loser view). cuBLAS = the live `Eager PyTorch` row (true-fp32 SGEMM /
 HGEMM).
 
 | shape | greedy µs | rec. golden µs | ratio | cuBLAS µs | vs cuBLAS | category |

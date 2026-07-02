@@ -2,9 +2,9 @@
 
 import pytest
 
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.loop import (
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
+from emmy.compiler.ir.loop import (
     Accum,
     Assign,
     Axis,
@@ -466,7 +466,7 @@ def test_update_op_conflict_rejected():
 
 
 def test_loop_stmt_basic():
-    from deplodock.compiler.ir.loop import Loop
+    from emmy.compiler.ir.loop import Loop
 
     # Pointwise kernel with body wrapped in a free Loop.
     loop = _loop(
@@ -488,7 +488,7 @@ def test_loop_stmt_basic():
 
 def test_loop_axis_sibling_same_name_allowed():
     """Sibling Loops with the same axis name are fine — that's softmax's two K-loops."""
-    from deplodock.compiler.ir.loop import Loop
+    from emmy.compiler.ir.loop import Loop
 
     # Two reduce Loops over the same axis, sibling (not nested).
     _loop(
@@ -509,7 +509,7 @@ def test_loop_ssa_scoping():
     The inner Assign binds to the inner axis (via ``$0``'s index) so LICM
     can't hoist it out; the outer reference is a true scope violation.
     """
-    from deplodock.compiler.ir.loop import Loop
+    from emmy.compiler.ir.loop import Loop
 
     with pytest.raises(ValueError, match="not defined"):
         _loop(
@@ -545,7 +545,7 @@ def _flat_reduce_kernel() -> LoopOp:
 
 def _nested_reduce_kernel() -> LoopOp:
     """Same kernel as _flat_reduce_kernel, but body is nested via explicit Loops."""
-    from deplodock.compiler.ir.loop import Loop
+    from emmy.compiler.ir.loop import Loop
 
     return LoopOp(
         body=(

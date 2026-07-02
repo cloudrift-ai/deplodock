@@ -1,10 +1,10 @@
-"""Unit tests for :mod:`deplodock.storage` — JSON file I/O with numpy support."""
+"""Unit tests for :mod:`emmy.storage` — JSON file I/O with numpy support."""
 
 from __future__ import annotations
 
 import numpy as np
 
-from deplodock import storage
+from emmy import storage
 
 
 def test_read_missing_returns_none(tmp_path):

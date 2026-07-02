@@ -11,7 +11,7 @@ golden config's ``knobs`` dict in place, preserving the rest of the file byte-fo
 
 :func:`legacy_to_codec` is deterministic and idempotent (a native dict round-trips unchanged), and
 delegates to the codec ``*.spell()`` builders so the mapping cannot drift from the parsers. The
-recorded ``deplodock_us`` / ``cublas_us`` latencies are left untouched — they are pre-rebuild
+recorded ``emmy_us`` / ``cublas_us`` latencies are left untouched — they are pre-rebuild
 measurements; re-tuning the set on hardware (``scripts/tune_golden_set.py`` / the ``tune-golden``
 skill) is a separate follow-up.
 
@@ -35,10 +35,10 @@ from pathlib import Path
 
 import yaml
 
-from deplodock.compiler.ir.tile.atom import atom_for
-from deplodock.compiler.ir.tile.schedule import ReducePlan, Stage, TilePlan, WarpTile, is_warp_codec
+from emmy.compiler.ir.tile.atom import atom_for
+from emmy.compiler.ir.tile.schedule import ReducePlan, Stage, TilePlan, WarpTile, is_warp_codec
 
-_GOLDENS_DIR = Path(__file__).resolve().parents[1] / "deplodock" / "compiler" / "pipeline" / "search" / "goldens"
+_GOLDENS_DIR = Path(__file__).resolve().parents[1] / "emmy" / "compiler" / "pipeline" / "search" / "goldens"
 
 # Legacy keys whose presence (or a binary-string ``STAGE``) marks a not-yet-migrated dict.
 _LEGACY_KEYS = frozenset({"BN", "BM", "FM", "FN", "BK", "SPLITK", "BR", "FK", "WN", "WM", "MMA", "RING", "TMA"})

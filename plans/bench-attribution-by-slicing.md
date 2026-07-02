@@ -48,7 +48,7 @@ Why this is better:
 3. `run --bench`'s kernel table: bench each slice via the normal `backend.benchmark`, render µs/% from the slice
    results. The `%` column is "share of Σ slice times", with the true program e2e printed beside it (the Σ-vs-e2e
    footer relationship from the finding-6 branch survives, just with the roles explicit).
-4. The interleaved comparison (`_bench_interleaved`): deplodock side = whole-program bench (one number, same as the
+4. The interleaved comparison (`_bench_interleaved`): emmy side = whole-program bench (one number, same as the
    torch closures). The per-iter `on_iter` interleaving is unchanged.
 
 ## Migration list (consumers of `per_launch` / the old sum semantics)
@@ -73,8 +73,8 @@ Ordered so each step lands green:
    `commands/compare.py::_compare_per_launch` for one transition (compare matches by kernel name, so the rename is
    the only break).
 4. **`tune --bench` per-kernel table / `62_kernel_bench.json`**: already slice-based (provenance reproducers);
-   no semantic change, but the "Deplodock" number per slice becomes the slice e2e — strictly more honest, and
-   `deplodock compare` across the boundary will show small shifts on multi-kernel slices. Call it out in the PR.
+   no semantic change, but the "Emmy" number per slice becomes the slice e2e — strictly more honest, and
+   `emmy compare` across the boundary will show small shifts on multi-kernel slices. Call it out in the PR.
 5. **Backend cleanup**: drop `capture_launch_graphs`/`_graphs`/`_graph_batch_sizes`, the per-position event lists,
    and `LaunchTime`/`per_launch` from `BenchmarkResult` once nothing reads them. `iter_once` becomes "replay the
    program graph once per window" + the uncaptured warmup walk.
@@ -86,7 +86,7 @@ Ordered so each step lands green:
 - **Warmup guards stay per-launch.** The uncaptured warmup iters are where the hung-kernel watchdog and the
   zero-elapsed degenerate-launch guard name a *specific* kernel. Keep the warmup walk launch-by-launch (it already
   is — capture only ever covered measurement) so a hang inside an 18-kernel program still says which kernel.
-- **One warm state per comparison table.** The eager/tcompile/deplodock table is untouched (one interleaved loop).
+- **One warm state per comparison table.** The eager/tcompile/emmy table is untouched (one interleaved loop).
   The kernel-table slice benches run sequentially with their own warmups — fine for attribution, but the table
   should keep the program-e2e footer so the Σ-vs-e2e gap stays visible rather than implied.
 - **Sweep cost profile.** The inner search benches single-node slices — identical cost before/after. No new
@@ -123,9 +123,9 @@ Ordered so each step lands green:
 - Unit: slice-bench of a 2-kernel chain ≈ sum of single-kernel slice benches (loose tolerance); program e2e of the
   chain ≥ max(slice times); single-launch program result identical pre/post refactor.
 - The finding-6 live check, re-run: Qwen3-Embedding-0.6B layer 0 on the RTX 5090 — table standings within noise of
-  eager 99 / tcompile 46 / deplodock 51 µs e2e; kernel-table Σ within ~10% of the old per-launch Σ (48.7 µs), with
+  eager 99 / tcompile 46 / emmy 51 µs e2e; kernel-table Σ within ~10% of the old per-launch Σ (48.7 µs), with
   per-kernel numbers now reproducible across runs (the mm0/mm1 5.1-vs-0.8 artifact gone — both gemms should read
   ~equal, cf. their NCU durations).
 - A `--clean` tune of one golden shape end-to-end (sweep cost unchanged, DB rows written, prior trains).
-- `deplodock compare` between a pre- and post-refactor dump of the same model: full-model row stable, per-kernel
+- `emmy compare` between a pre- and post-refactor dump of the same model: full-model row stable, per-kernel
   diffs explainable by the slice semantics (call out in the PR).

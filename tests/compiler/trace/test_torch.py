@@ -7,7 +7,7 @@ These tests require PyTorch.
 
 import pytest
 
-from deplodock.compiler.trace.torch import has_torch
+from emmy.compiler.trace.torch import has_torch
 
 pytestmark = pytest.mark.skipif(not has_torch(), reason="PyTorch not available")
 
@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(not has_torch(), reason="PyTorch not available")
 
 def test_get_reduce_axis_from_list():
     """_get_reduce_axis extracts the first axis from a list arg."""
-    from deplodock.compiler.trace.torch import _get_reduce_axis
+    from emmy.compiler.trace.torch import _get_reduce_axis
 
     class FakeNode:
         args = [None, [2, 3]]
@@ -29,7 +29,7 @@ def test_get_reduce_axis_from_list():
 
 def test_get_reduce_axis_scalar():
     """_get_reduce_axis handles a scalar axis."""
-    from deplodock.compiler.trace.torch import _get_reduce_axis
+    from emmy.compiler.trace.torch import _get_reduce_axis
 
     class FakeNode:
         args = [None, -1]
@@ -39,7 +39,7 @@ def test_get_reduce_axis_scalar():
 
 def test_get_reduce_axis_default():
     """_get_reduce_axis defaults to -1 when no axis arg is present."""
-    from deplodock.compiler.trace.torch import _get_reduce_axis
+    from emmy.compiler.trace.torch import _get_reduce_axis
 
     class FakeNode:
         args = [None]
@@ -49,7 +49,7 @@ def test_get_reduce_axis_default():
 
 def test_op_name_aten_format():
     """_op_name extracts short name from aten.xxx.yyy targets."""
-    from deplodock.compiler.trace.torch import _op_name
+    from emmy.compiler.trace.torch import _op_name
 
     # _op_name returns the raw aten short name; ATEN→numpy translation
     # (``mul`` → ``multiply``) happens later in _handle_call_function.
@@ -60,7 +60,7 @@ def test_op_name_aten_format():
 
 def test_op_name_non_aten():
     """_op_name returns None for non-ATen targets."""
-    from deplodock.compiler.trace.torch import _op_name
+    from emmy.compiler.trace.torch import _op_name
 
     assert _op_name("some.custom.op") is None
     assert _op_name("prims.convert_element_type.default") is None
@@ -68,9 +68,9 @@ def test_op_name_non_aten():
 
 def test_resolve_inputs_scalars_become_constants():
     """Scalar args (int, float) are promoted to ConstantOp nodes."""
-    from deplodock.compiler.graph import Graph, Tensor
-    from deplodock.compiler.ir.base import ConstantOp, InputOp
-    from deplodock.compiler.trace.torch import _resolve_inputs
+    from emmy.compiler.graph import Graph, Tensor
+    from emmy.compiler.ir.base import ConstantOp, InputOp
+    from emmy.compiler.trace.torch import _resolve_inputs
 
     g = Graph()
     x = g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4,)), node_id="x")
@@ -108,8 +108,8 @@ def test_trace_all_elementwise_ops():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.ir.tensor.ir import ElementwiseOp
+    from emmy.compiler.trace.torch import trace_module
 
     class AllOps(nn.Module):
         def forward(self, x):
@@ -135,8 +135,8 @@ def test_trace_binary_ops():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.ir.tensor.ir import ElementwiseOp
+    from emmy.compiler.trace.torch import trace_module
 
     class BinaryOps(nn.Module):
         def forward(self, x, y):
@@ -164,8 +164,8 @@ def test_trace_sum_reduction():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.ir.tensor.ir import ReduceOp
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.ir.tensor.ir import ReduceOp
+    from emmy.compiler.trace.torch import trace_module
 
     class SumReduce(nn.Module):
         def forward(self, x):
@@ -185,8 +185,8 @@ def test_trace_max_reduction():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.ir.tensor.ir import ReduceOp
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.ir.tensor.ir import ReduceOp
+    from emmy.compiler.trace.torch import trace_module
 
     class MaxReduce(nn.Module):
         def forward(self, x):
@@ -211,8 +211,8 @@ def test_trace_reshape():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.ir.frontend.ir import ReshapeOp
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.ir.frontend.ir import ReshapeOp
+    from emmy.compiler.trace.torch import trace_module
 
     class Reshape(nn.Module):
         def forward(self, x):
@@ -231,8 +231,8 @@ def test_trace_transpose():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.ir.frontend.ir import TransposeOp
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.ir.frontend.ir import TransposeOp
+    from emmy.compiler.trace.torch import trace_module
 
     class Transpose(nn.Module):
         def forward(self, x):
@@ -256,8 +256,8 @@ def test_trace_linear_produces_linearop():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.ir.frontend.ir import LinearOp
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.ir.frontend.ir import LinearOp
+    from emmy.compiler.trace.torch import trace_module
 
     linear = nn.Linear(8, 4, bias=False)
     x = torch.randn(2, 8)
@@ -272,8 +272,8 @@ def test_trace_linear_with_bias():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.ir.frontend.ir import LinearOp
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.ir.frontend.ir import LinearOp
+    from emmy.compiler.trace.torch import trace_module
 
     linear = nn.Linear(8, 4, bias=True)
     x = torch.randn(2, 8)
@@ -294,7 +294,7 @@ def test_trace_passthrough_ops_no_extra_nodes():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.trace.torch import trace_module
 
     class PassThrough(nn.Module):
         def forward(self, x):
@@ -318,7 +318,7 @@ def test_trace_empty_module():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.trace.torch import trace_module
 
     class Identity(nn.Module):
         def forward(self, x):
@@ -337,7 +337,7 @@ def test_trace_multiple_outputs():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.trace.torch import trace_module
 
     class MultiOut(nn.Module):
         def forward(self, x):
@@ -359,9 +359,9 @@ def test_trace_expand_is_broadcast_not_reshape():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.ir.frontend.ir import ReshapeOp
-    from deplodock.compiler.ir.tensor.ir import IndexMapOp
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.ir.frontend.ir import ReshapeOp
+    from emmy.compiler.ir.tensor.ir import IndexMapOp
+    from emmy.compiler.trace.torch import trace_module
 
     class Expand(nn.Module):
         def forward(self, x):  # (1, 8, 1, 4) -> (1, 8, 2, 4)
@@ -380,8 +380,8 @@ def test_trace_repeat_kv_correct():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.backend.loop.backend import LoopBackend
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.loop.backend import LoopBackend
+    from emmy.compiler.trace.torch import trace_module
 
     KV, NREP, S, Dh = 8, 2, 4, 16
 

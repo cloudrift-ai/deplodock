@@ -1,4 +1,4 @@
-"""Tests for ``deplodock eval knobs`` / ``eval variants`` — the tune-DB analysis CLIs.
+"""Tests for ``emmy eval knobs`` / ``eval variants`` — the tune-DB analysis CLIs.
 
 Each test builds a synthetic tune-DB inline (just the two tables the
 commands read: ``cuda_op`` and ``perf``), so the suite stays hermetic
@@ -252,7 +252,7 @@ def test_failures_clusters_by_kernel_and_error(run_cli, tmp_path):
     the knob values shared by every failing row in a cluster (the 'all rows have
     TMA=1' forensics signal). Built with the real ``SearchDB`` write path so the
     error column round-trips end to end."""
-    from deplodock.compiler.pipeline.search.db import PerfStats, SearchDB
+    from emmy.compiler.pipeline.search.db import PerfStats, SearchDB
 
     def stats(median):
         return PerfStats(median=median, min=median, max=median, mean=median, variance=0.0, n_samples=1)
@@ -323,7 +323,7 @@ def test_prior_db_reachability_smoke(run_cli, tmp_path):
 def test_prior_nodes_smoke(run_cli, tmp_path):
     """``eval prior --dataset nodes`` renders the fork sibling-ranking AND the leaf
     reachability over the search-tree node store (one fork, two leaf children)."""
-    from deplodock.compiler.pipeline.search.db import NodeRow, SearchDB
+    from emmy.compiler.pipeline.search.db import NodeRow, SearchDB
 
     db_path = tmp_path / "n.db"
     db = SearchDB(db_path)
@@ -346,7 +346,7 @@ def test_prior_nodes_smoke(run_cli, tmp_path):
 
 def test_prior_nodes_kernel_filter(run_cli, tmp_path):
     """``eval prior --dataset nodes --kernel`` scopes the node store by op label."""
-    from deplodock.compiler.pipeline.search.db import NodeRow, SearchDB
+    from emmy.compiler.pipeline.search.db import NodeRow, SearchDB
 
     db_path = tmp_path / "n.db"
     db = SearchDB(db_path)
@@ -388,9 +388,9 @@ def test_o3_reservoir_index_joins_db_rows_by_sig_and_knobs():
     """``_o3_reservoir_index`` keeps only ``H_opt=3`` reservoir rows and keys them
     so a DB sample with the same ``S_*`` signature + tunable knobs joins (the -O3
     re-bench never writes a ``perf`` row, so the reservoir is the only -O3 source)."""
-    from deplodock.commands.eval import _o3_reservoir_index, _variant_key
-    from deplodock.compiler.pipeline.search.data import Sample
-    from deplodock.compiler.pipeline.search.db import PerfSample
+    from emmy.commands.eval import _o3_reservoir_index, _variant_key
+    from emmy.compiler.pipeline.search.data import Sample
+    from emmy.compiler.pipeline.search.db import PerfSample
 
     stamped = {"BM": 8, "BN": 16, "S_ext_free_prod": 1024.0}
 
@@ -412,9 +412,9 @@ def test_emit_variant_table_o3_column_and_deterministic_pick(caplog):
     reservoir latency for the matching config and ``—`` elsewhere."""
     import logging
 
-    from deplodock.commands.eval import _emit_variant_table, _variant_key
-    from deplodock.compiler.pipeline.search.data import Sample
-    from deplodock.compiler.pipeline.search.db import PerfSample
+    from emmy.commands.eval import _emit_variant_table, _variant_key
+    from emmy.compiler.pipeline.search.data import Sample
+    from emmy.compiler.pipeline.search.db import PerfSample
 
     samples = [
         Sample.from_perf_sample(PerfSample(pretty="__global__ void k_m(float*)", knobs={"BM": 8, "BN": 16}, latency_us=30.0)),
@@ -431,7 +431,7 @@ def test_emit_variant_table_o3_column_and_deterministic_pick(caplog):
             return best_i, scores[best_i]
 
     o3 = {_variant_key(samples[0]): 9.5}
-    with caplog.at_level(logging.INFO, logger="deplodock.commands.eval"):
+    with caplog.at_level(logging.INFO, logger="emmy.commands.eval"):
         _emit_variant_table("k_m", samples, _P(), n_fail=0, o3=o3, top=0)
     out = "\n".join(caplog.messages)
     assert "-O3 us" in out
@@ -444,7 +444,7 @@ def test_knob_columns_names_in_header_values_in_cells():
     """``knob_columns`` puts the knob name in the column header (canonical knob_sort_key
     order) and value-only cells (no ``NAME=`` prefix), blank where a row lacks a knob;
     ``render_table`` aligns the columns to the widest of header + cells."""
-    from deplodock.commands.table import knob_columns, render_table
+    from emmy.commands.table import knob_columns, render_table
 
     cols, cells = knob_columns(
         [
@@ -465,7 +465,7 @@ def test_render_table_ansi_aware_width():
     throw off column alignment (right- and left-aligned columns both line up)."""
     import re  # noqa: PLC0415
 
-    from deplodock.commands.table import Col, render_table
+    from emmy.commands.table import Col, render_table
 
     lines = render_table([Col("a", "r"), Col("b")], [["1", "x"], [("22", "\033[31m"), "y"]])
     plain = [re.sub(r"\033\[[0-9]+m", "", line) for line in lines]

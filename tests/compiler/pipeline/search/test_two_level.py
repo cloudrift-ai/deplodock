@@ -17,18 +17,18 @@ import zlib
 
 import pytest
 
-from deplodock.compiler.backend.base import BenchmarkResult, LaunchTime
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.cuda.ir import CudaOp
-from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline, TuningSearch
-from deplodock.compiler.pipeline.search.db import SearchDB
-from deplodock.compiler.pipeline.search.keys import op_cache_key
-from deplodock.compiler.pipeline.search.slice import single_node_graph
-from deplodock.compiler.pipeline.search.two_level import (
+from emmy.compiler.backend.base import BenchmarkResult, LaunchTime
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.cuda.ir import CudaOp
+from emmy.compiler.ir.frontend.ir import MatmulOp
+from emmy.compiler.ir.loop import LoopOp
+from emmy.compiler.pipeline import LOOP_PASSES, Pipeline, TuningSearch
+from emmy.compiler.pipeline.search.db import SearchDB
+from emmy.compiler.pipeline.search.keys import op_cache_key
+from emmy.compiler.pipeline.search.slice import single_node_graph
+from emmy.compiler.pipeline.search.two_level import (
     LOWERING_PASSES,
 )
 from tests.compiler.conftest import drain_tune, run_inner_reward, run_two_level
@@ -42,12 +42,12 @@ _PATIENCE = 8
 
 @pytest.fixture(autouse=True)
 def _force_target(monkeypatch, tmp_path):
-    from deplodock.compiler import target as target_mod
+    from emmy.compiler import target as target_mod
 
     # Isolate the learned-prior checkpoint: ``run_two_level_tune`` trains and
     # checkpoints the global prior, and these fake-backend rows must never
-    # pollute the host's real ``~/.cache/deplodock/prior.json``.
-    monkeypatch.setenv("DEPLODOCK_PRIOR_FILE", str(tmp_path / "prior.json"))
+    # pollute the host's real ``~/.cache/emmy/prior.json``.
+    monkeypatch.setenv("EMMY_PRIOR_FILE", str(tmp_path / "prior.json"))
     target_mod.set_target((8, 0))
     yield
     target_mod.set_target(None)
@@ -266,7 +266,7 @@ def test_inner_reward_parallel_matches_serial(monkeypatch) -> None:
     ``op_cache_key`` (slot-independent), so completion order can't change the
     result. ``prior=None`` keeps this off the learned-prior (catboost) path.
 
-    The tile is pinned to per-cell (``DEPLODOCK_TILE=""``) so the matmul enumerates a
+    The tile is pinned to per-cell (``EMMY_TILE=""``) so the matmul enumerates a
     single candidate: the tile move catalog (``search/space.py``) now offers ~20
     scalar tiles per contraction, and under the small ``_PATIENCE`` window the
     patience-limited MCTS explores a *subset* whose membership is sensitive to the
@@ -274,7 +274,7 @@ def test_inner_reward_parallel_matches_serial(monkeypatch) -> None:
     total only holds once the candidate set is fixed. Pinning isolates the
     orchestration invariant this test targets (the reward summing / multiplicity across
     backends); the search-space breadth is covered by ``test_inner_reward_is_separable``."""
-    monkeypatch.setenv("DEPLODOCK_TILE", "")
+    monkeypatch.setenv("EMMY_TILE", "")
     fused = _fuse(_two_distinct_matmuls())
     ctx = Context.from_target((8, 0))
 

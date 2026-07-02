@@ -12,13 +12,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from deplodock.compiler import dtype as dt
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.loop.ir import LoopOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline import Pipeline
+from emmy.compiler import dtype as dt
+from emmy.compiler.dim import Dim
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.loop.ir import LoopOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
+from emmy.compiler.pipeline import Pipeline
 
 from ..conftest import from_pretrained_or_skip
 
@@ -107,8 +107,8 @@ def test_cuda_symbolic_elementwise_one_kernel_multiple_seq_lens():
     pytest = __import__("pytest")
     cupy = pytest.importorskip("cupy")
     del cupy
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.ir.cuda import CudaOp
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.ir.cuda import CudaOp
 
     graph = _symbolic_elementwise_graph()
     backend = CudaBackend()
@@ -137,7 +137,7 @@ def test_symbolic_sdpa_traces_and_decomposes():
     shapes carry symbolic dims end-to-end."""
     import torch
 
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.trace.torch import trace_module
 
     class AttnBlock(torch.nn.Module):
         def forward(self, q, k, v):
@@ -169,8 +169,8 @@ def test_cuda_softmax_over_symbolic_seq_len():
     pytest.importorskip("cupy")
     import torch
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.trace.torch import trace_module
 
     class Softmax(torch.nn.Module):
         def forward(self, x):
@@ -196,8 +196,8 @@ def test_cuda_sdpa_over_symbolic_seq_len():
     pytest.importorskip("cupy")
     import torch
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.trace.torch import trace_module
 
     class Attn(torch.nn.Module):
         def forward(self, q, k, v):
@@ -234,8 +234,8 @@ def test_cuda_symbolic_rmsnorm_traced_and_run():
     pytest.importorskip("cupy")
     import torch
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.trace.torch import trace_module
 
     m = torch.nn.RMSNorm(2048)
     graph = trace_module(m, (torch.randn(1, 32, 2048),), dynamic_shapes={"x": {1: _seq_len_dim()}})
@@ -259,8 +259,8 @@ def test_reshape_negative_one_infers_through_symbolic_dim():
     each side — the typical ``x.reshape(B, S, H, -1)`` pattern."""
     import torch
 
-    from deplodock.compiler.pipeline import Pipeline
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.pipeline import Pipeline
+    from emmy.compiler.trace.torch import trace_module
 
     class ReshapeWithMinusOne(torch.nn.Module):
         def forward(self, x):
@@ -285,10 +285,10 @@ def test_cuda_symbolic_linear_traced_and_run():
     pytest.importorskip("cupy")
     import torch
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.ir.base import ConstantOp
-    from deplodock.compiler.loader.binder import apply_load_ops
-    from deplodock.compiler.trace.torch import trace_module_with_constants
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.ir.base import ConstantOp
+    from emmy.compiler.loader.binder import apply_load_ops
+    from emmy.compiler.trace.torch import trace_module_with_constants
 
     m = torch.nn.Linear(128, 256, bias=False)
     # ``Linear.forward`` declares the activation arg as ``input`` — torch.export
@@ -339,12 +339,12 @@ def test_qwen_whole_model_dynamic_compiles_and_matches_eager():
     import torch
     from transformers import AutoConfig, AutoModel
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.backend.cuda.program import CompiledProgram
-    from deplodock.compiler.backend.gpu_lock import gpu_lock
-    from deplodock.compiler.loader.binder import bind_constants
-    from deplodock.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.gpu_lock import gpu_lock
+    from emmy.compiler.loader.binder import bind_constants
+    from emmy.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
+    from emmy.compiler.trace.torch import trace_module
 
     torch.manual_seed(0)
     config = from_pretrained_or_skip(AutoConfig.from_pretrained, "Qwen/Qwen3-Embedding-0.6B")
@@ -409,12 +409,12 @@ def test_qwen_layer_dynamic_compiles_and_matches_eager():
     import torch
     from transformers import AutoConfig, AutoModel
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.backend.cuda.program import CompiledProgram
-    from deplodock.compiler.backend.gpu_lock import gpu_lock
-    from deplodock.compiler.loader.binder import bind_constants
-    from deplodock.compiler.trace.huggingface import build_layer_wrapper
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.gpu_lock import gpu_lock
+    from emmy.compiler.loader.binder import bind_constants
+    from emmy.compiler.trace.huggingface import build_layer_wrapper
+    from emmy.compiler.trace.torch import trace_module
 
     torch.manual_seed(0)
     config = from_pretrained_or_skip(AutoConfig.from_pretrained, "Qwen/Qwen3-Embedding-0.6B")
@@ -469,8 +469,8 @@ def test_qwen_whole_model_dynamic_traces():
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    from deplodock.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
+    from emmy.compiler.trace.torch import trace_module
 
     torch.manual_seed(0)
     config = from_pretrained_or_skip(AutoConfig.from_pretrained, "Qwen/Qwen3-Embedding-0.6B")
@@ -522,10 +522,10 @@ def test_capture_replay_cache_rmsnorm_over_capacity_buffers():
     pytest.importorskip("cupy")
     import torch
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.backend.cuda.program import CompiledProgram
-    from deplodock.compiler.backend.gpu_lock import gpu_lock
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.gpu_lock import gpu_lock
+    from emmy.compiler.trace.torch import trace_module
 
     cap = 64
     m = torch.nn.RMSNorm(2048)
@@ -563,10 +563,10 @@ def test_capture_replay_device_io_matches_eager():
     import cupy as cp
     import torch
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.backend.cuda.program import CompiledProgram
-    from deplodock.compiler.backend.gpu_lock import gpu_lock
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.gpu_lock import gpu_lock
+    from emmy.compiler.trace.torch import trace_module
 
     cap = 48
     m = torch.nn.RMSNorm(1024)
@@ -602,12 +602,12 @@ def test_qwen_whole_model_capture_replay_cache_matches_eager():
     import torch
     from transformers import AutoConfig, AutoModel
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.backend.cuda.program import CompiledProgram
-    from deplodock.compiler.backend.gpu_lock import gpu_lock
-    from deplodock.compiler.loader.binder import bind_constants
-    from deplodock.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.gpu_lock import gpu_lock
+    from emmy.compiler.loader.binder import bind_constants
+    from emmy.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
+    from emmy.compiler.trace.torch import trace_module
 
     torch.manual_seed(0)
     config = from_pretrained_or_skip(AutoConfig.from_pretrained, "Qwen/Qwen3-Embedding-0.6B")

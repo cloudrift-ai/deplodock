@@ -1,13 +1,13 @@
 ---
 name: discover-new-models
-description: Use this skill when the user asks "what new models should we try / benchmark", "find / discover new (open) models worth exploring", "scout trending models for our GPUs", "which new models fit B200 / H200 / H100 / Pro6000 / 5090 / 4090", "what's new and worth benchmarking", or otherwise wants a shortlist of newly-released, in-demand open-weight models deplodock doesn't support yet, each mapped to the hardware it runs on. Produces a ranked, hardware-bucketed shortlist ready to hand to the `benchmark-new-model` skill. Discovery + popularity come from `scripts/new_models.py` (keyless); hype/news from web search; hardware fit from a VRAM calculation.
+description: Use this skill when the user asks "what new models should we try / benchmark", "find / discover new (open) models worth exploring", "scout trending models for our GPUs", "which new models fit B200 / H200 / H100 / Pro6000 / 5090 / 4090", "what's new and worth benchmarking", or otherwise wants a shortlist of newly-released, in-demand open-weight models emmy doesn't support yet, each mapped to the hardware it runs on. Produces a ranked, hardware-bucketed shortlist ready to hand to the `benchmark-new-model` skill. Discovery + popularity come from `scripts/new_models.py` (keyless); hype/news from web search; hardware fit from a VRAM calculation.
 version: 0.1.0
 ---
 
 # Discover New Models to Explore
 
 Turn "what new models are worth our GPU hours?" into a concrete, ranked shortlist: newly-released open-weight
-models deplodock **doesn't support yet**, filtered to the ones with real demand/hype, each tagged with the GPU
+models emmy **doesn't support yet**, filtered to the ones with real demand/hype, each tagged with the GPU
 configs it fits. The output is a hand-off list for the **`benchmark-new-model`** skill — this skill never
 deploys or benchmarks anything itself; it researches and recommends.
 
@@ -87,7 +87,7 @@ Combine signals into a shortlist. A model is **promising** when it scores on sev
 - High HF `trending` (real, current momentum) — weighted highest for "what's hot".
 - High arena `elo` / low `arena_rank` (proven quality) — when present.
 - Strong Step-2 hype (mindshare, benchmark wins, reputable lab).
-- **Novelty for deplodock** — a new architecture / quant / size we haven't benchmarked teaches us more than yet
+- **Novelty for emmy** — a new architecture / quant / size we haven't benchmarked teaches us more than yet
   another sibling of an existing recipe.
 
 Drop: tiny fine-tuning bases riding download counts, models with no engine support yet (note it, revisit later),

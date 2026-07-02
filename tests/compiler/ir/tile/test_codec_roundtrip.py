@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.ir.schedule import ReducePlan, Stage, TilePlan
+from emmy.compiler.ir.schedule import ReducePlan, Stage, TilePlan
 
 
 @pytest.mark.parametrize("spec", ["", "b8", "b16", "b32", "r4", "g2a", "g2k", "g4a/b32", "g2k/b16/r4"])

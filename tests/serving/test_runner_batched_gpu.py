@@ -1,8 +1,8 @@
-"""Static batched serving path (``DEPLODOCK_SERVING_STATIC=1``).
+"""Static batched serving path (``EMMY_SERVING_STATIC=1``).
 
 ``perf``-marked (deselected by default — run with ``pytest -m perf``): needs CUDA
 + cupy + the Qwen3-Embedding config. Builds a 1-layer static ``(batch, S)`` trunk,
-wraps a ``DeplodockForwardRunner`` around it, and checks that
+wraps a ``EmmyForwardRunner`` around it, and checks that
 ``forward_hidden_states_batched`` runs several different-length sequences in ONE
 padded batched forward and matches eager per row — the causal-independence claim
 (a row's real prefix is unaffected by right-padding, dummy rows below the batch cap
@@ -22,13 +22,13 @@ def test_runner_batched_matches_eager():
     import torch
     from transformers import AutoConfig, AutoModel
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.backend.cuda.program import CompiledProgram
-    from deplodock.compiler.backend.gpu_lock import gpu_lock
-    from deplodock.compiler.loader.binder import bind_constants
-    from deplodock.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
-    from deplodock.compiler.trace.torch import trace_module
-    from deplodock.serving.runner import DeplodockForwardRunner
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.gpu_lock import gpu_lock
+    from emmy.compiler.loader.binder import bind_constants
+    from emmy.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
+    from emmy.compiler.trace.torch import trace_module
+    from emmy.serving.runner import EmmyForwardRunner
 
     torch.manual_seed(0)
     cfg = AutoConfig.from_pretrained(MODEL)
@@ -58,7 +58,7 @@ def test_runner_batched_matches_eager():
     }
     with gpu_lock():
         program = CompiledProgram.build(compiled, {**const_feed, **feed})
-        runner = DeplodockForwardRunner(
+        runner = EmmyForwardRunner(
             program=program,
             input_names=(ids_name, mask_name, pos_name),
             output_name=compiled.outputs[0],

@@ -1,4 +1,4 @@
-"""Tests for ``deplodock.compiler.pipeline.dump``.
+"""Tests for ``emmy.compiler.pipeline.dump``.
 
 Two surfaces in one file: the Graphviz DOT emitter (``_graph_to_dot``,
 checked at the source-string level — rendering to SVG/PNG is left to the
@@ -12,13 +12,13 @@ from __future__ import annotations
 
 import json
 
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.expr import placeholder
-from deplodock.compiler.ir.frontend.ir import RmsNormOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource, ReduceOp
-from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
-from deplodock.compiler.pipeline.dump import CompilerDump, _graph_to_dot
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import ConstantOp, InputOp
+from emmy.compiler.ir.expr import placeholder
+from emmy.compiler.ir.frontend.ir import RmsNormOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource, ReduceOp
+from emmy.compiler.pipeline import TILE_PASSES, Pipeline
+from emmy.compiler.pipeline.dump import CompilerDump, _graph_to_dot
 
 # ---------- _graph_to_dot ----------
 

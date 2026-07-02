@@ -12,11 +12,11 @@ from __future__ import annotations
 
 import numpy as np
 
-from deplodock.compiler import dtype as _dt
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import LinearOp, RmsNormOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler import dtype as _dt
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.frontend.ir import LinearOp, RmsNormOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
 
 from ..conftest import requires_cuda, requires_sm90
 
@@ -52,8 +52,8 @@ def test_mlp_slice_completes_and_matches():
     """The fused linear+mean shape compiles and runs to completion under the default greedy
     pick (a WS=1 regression would trip the per-launch watchdog's HungKernelError) and matches
     the numpy reference."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.backend.numpy import NumpyBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.numpy import NumpyBackend
 
     g = _build_mlp_slice()
     rng = np.random.default_rng(0)

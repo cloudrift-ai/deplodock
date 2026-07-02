@@ -1,6 +1,6 @@
 """Single source of truth for tests expected to fail during the tile-IR rebuild.
 
-The tile IR (``deplodock/compiler/ir/tile/`` + ``.../pipeline/passes/lowering/tile/`` +
+The tile IR (``emmy/compiler/ir/tile/`` + ``.../pipeline/passes/lowering/tile/`` +
 ``.../pipeline/passes/lowering/kernel/``) was demolished to a clean slate and is being rebuilt
 from scratch. Until each capability is restored, the integration / accuracy tests that exercise
 it cannot pass. Rather than scatter ``@pytest.mark.xfail`` decorators across the suite, every
@@ -44,7 +44,7 @@ XFAIL: dict[str, str] = {
     # the oracle rebuild stays a tile-ir-rebuild follow-up, with the visualizer scripts as its
     # consumers).
     # test_cooperative_flash_matches_torch RECOVERED — the carrier-generic coop tier handles the
-    # twisted flash carrier; the test's dead legacy ``DEPLODOCK_BR`` pin was modernized to the
+    # twisted flash carrier; the test's dead legacy ``EMMY_BR`` pin was modernized to the
     # live ``REDUCE=b<n>`` codec (shuffle combine at b32, the hierarchical smem tree at b64).
     # test_fused_edge.py was rewritten black-box off the demolished enumeration/assembly API. The
     # scalar cells AND the pure-MAP warp cells (relu / sigmoid / multiply) are green — the demoted
@@ -56,7 +56,7 @@ XFAIL: dict[str, str] = {
     "test_fused_edge.py::test_fused_map_matmul[warp-broadcast": _R,
     "test_fused_edge.py::test_fused_rmsnorm_linear[warp": _R,
     # test_matmul_mma.py / _transposed_b.py / _residual.py / _causal_epilogue.py deleted — those
-    # legacy-API (DEPLODOCK_MMA / WM / WN / BK pin) per-capability tests are superseded by the
+    # legacy-API (EMMY_MMA / WM / WN / BK pin) per-capability tests are superseded by the
     # warp-tier matrix in test_matmul_coverage (the WARP codec): plain + transposed-B + the
     # bias/relu/residual/causal epilogues, static AND dynamic, all recovered by the gmem-direct
     # mma.sync _warp materializer. test_matmul_rules.py / test_register_tile_rules.py deleted too

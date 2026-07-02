@@ -27,13 +27,13 @@ import numpy as np
 import pytest
 import torch
 
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.ir.axis import Axis, AxisRole
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.loop.ir import Accum, Assign, Body, Load, Loop
-from deplodock.compiler.pipeline.passes.lowering.tile._softmax import _fuse, online_softmax_combine
-from deplodock.compiler.trace.torch import trace_module
+from emmy.compiler.dim import Dim
+from emmy.compiler.ir.axis import Axis, AxisRole
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.loop.ir import Accum, Assign, Body, Load, Loop
+from emmy.compiler.pipeline.passes.lowering.tile._softmax import _fuse, online_softmax_combine
+from emmy.compiler.trace.torch import trace_module
 
 from ..conftest import requires_cuda
 
@@ -104,14 +104,14 @@ def _compile_run(
     spec like ``"seq_len@x:1"``) the named axis is traced symbolic and run at runtime size
     ``seq`` — one compiled kernel exercised at an off-hint length (the cooperative reduce
     strides to ``seq``, idle lanes folding the identity)."""
-    from deplodock.commands.trace import graph_from_code
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.ir.base import ConstantOp
+    from emmy.commands.trace import graph_from_code
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.ir.base import ConstantOp
 
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     if dynamic is not None:
-        from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
+        from emmy.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
 
         ds = build_torch_dynamic_shapes(parse_position_specs([dynamic]))
         graph = graph_from_code(code, dynamic_shapes=ds)[0]
@@ -205,7 +205,7 @@ def test_cooperative_combine_accuracy(op, variant, shape, monkeypatch):
     divisor is the runtime extent too (a ``context_value`` constant resolved at launch), so
     dynamic ``mean`` divides by the right count."""
     code, ref_fn = _OPS[op]
-    got, xs, src = _compile_run(code, {"DEPLODOCK_REDUCE": _COOP_VARIANTS[variant]}, monkeypatch, dynamic=_SHAPES[shape], seq=_DYNAMIC_SEQ)
+    got, xs, src = _compile_run(code, {"EMMY_REDUCE": _COOP_VARIANTS[variant]}, monkeypatch, dynamic=_SHAPES[shape], seq=_DYNAMIC_SEQ)
     want = ref_fn(xs).reshape(got.shape)
     diff = float(np.abs(got - want).max())
     assert diff < 1e-3, f"{op}/{variant}/{shape}: combine mismatch (max abs err {diff})"
@@ -236,7 +236,7 @@ def test_symbolic_cooperative_softmax_sweep(monkeypatch, seq):
     carries the runtime ``seq_len`` arg + the cooperative ``__shfl_xor_sync`` combine over the
     strided ``< seq_len`` bound (vs the old degenerate per-thread serial reduce), in a 2-warp
     block."""
-    got, xs, src = _compile_run(_STRADDLE_SOFTMAX, {"DEPLODOCK_REDUCE": "b64"}, monkeypatch, dynamic="seq_len@x:1", seq=seq)
+    got, xs, src = _compile_run(_STRADDLE_SOFTMAX, {"EMMY_REDUCE": "b64"}, monkeypatch, dynamic="seq_len@x:1", seq=seq)
     want = _ref_softmax(xs).reshape(got.shape)
     assert got.shape == (8, seq)
     diff = float(np.abs(got - want).max())
@@ -258,7 +258,7 @@ def test_attention_combine_accuracy(variant, monkeypatch):
     """The flash ``(m, l, O)`` twisted-monoid carrier is accurate AND emits the pinned combine
     serially and with a cooperative-KV combine — a 3-component warp butterfly over the static
     KV axis (the same carrier-generic combine, ``coop_warp`` = ``b32``)."""
-    env = {"DEPLODOCK_REDUCE": _COOP_VARIANTS[variant]}
+    env = {"EMMY_REDUCE": _COOP_VARIANTS[variant]}
     code, ref_fn = _OPS["attention"]
     got, xs, src = _compile_run(code, env, monkeypatch)
     want = ref_fn(xs).reshape(got.shape)
@@ -300,7 +300,7 @@ def test_cross_cta_finalize_accuracy_and_structure(carrier, finalize, monkeypatc
     The finalize is the native ``REDUCE`` codec's ``c`` letter — one knob owns split + finalize."""
     spec = _CROSS_CTA[carrier]
     code, ref_fn = _OPS[spec["op"]]
-    env = {"DEPLODOCK_REDUCE": "g2a" if finalize == "atomic" else "g2k"}
+    env = {"EMMY_REDUCE": "g2a" if finalize == "atomic" else "g2k"}
     got, xs, src = _compile_run(code, env, monkeypatch)
     want = ref_fn(xs).reshape(got.shape)
     diff = float(np.abs(got - want).max())
@@ -333,7 +333,7 @@ def test_split_reduce_projection_epilogue(op, finalize, monkeypatch):
     ``sqrt`` does not, so the atomic finalize REFUSES (``NotImplementedError`` → pin ``g<n>k``).
     The deferred-kernel finalize projects once after the combine and is accurate for both."""
     code, ref_fn = _OPS[op]
-    env = {"DEPLODOCK_REDUCE": "g2a" if finalize == "atomic" else "g2k"}
+    env = {"EMMY_REDUCE": "g2a" if finalize == "atomic" else "g2k"}
     if finalize == "atomic" and not _PROJECTION_DISTRIBUTES[op]:
         with pytest.raises(NotImplementedError, match="non-distributive projection"):
             _compile_run(code, env, monkeypatch)
@@ -426,7 +426,7 @@ def test_fuse_collapses_only_the_online_softmax_pair(kind, should_fuse) -> None:
 @requires_cuda
 @pytest.mark.parametrize("shape", [(4, 128), (8, 256), (2, 64), (2, 4, 128)])
 def test_online_softmax_matches_torch(shape) -> None:
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     torch.manual_seed(0)
     x = torch.randn(*shape)
@@ -457,9 +457,9 @@ def test_online_softmax_matches_torch(shape) -> None:
 
 
 def _reduce_graph(shape: tuple):
-    from deplodock.compiler.graph import Graph, Tensor  # noqa: PLC0415
-    from deplodock.compiler.ir.base import InputOp  # noqa: PLC0415
-    from deplodock.compiler.ir.tensor.ir import ReduceOp  # noqa: PLC0415
+    from emmy.compiler.graph import Graph, Tensor  # noqa: PLC0415
+    from emmy.compiler.ir.base import InputOp  # noqa: PLC0415
+    from emmy.compiler.ir.tensor.ir import ReduceOp  # noqa: PLC0415
 
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", shape), node_id="x")
@@ -473,10 +473,10 @@ def _reduce_graph(shape: tuple):
 def test_2d_segmented_coop_reduce_accuracy(monkeypatch):
     """A pinned 2D row (BN=8, BR=16) computes the same per-row sums as numpy —
     the segmented shuffle combines each row independently."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     for key, val in dict(BN=8, BR=16, FN=1, FK=1, BK=2).items():
-        monkeypatch.setenv(f"DEPLODOCK_{key}", str(val))
+        monkeypatch.setenv(f"EMMY_{key}", str(val))
     g = _reduce_graph((64, 128))
     rng = np.random.default_rng(0)
     x = rng.standard_normal((64, 128)).astype(np.float32)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Diagnostic: trace a full LLM via torch.export + deplodock's tracer.
+"""Diagnostic: trace a full LLM via torch.export + emmy's tracer.
 
 Prints the aten ops the tracer's ``_handle_call_function`` would either
 hit directly or drop into the fallback path, so we can see at a glance
@@ -83,7 +83,7 @@ def main() -> int:
     import torch
     from transformers import AutoModelForCausalLM
 
-    from deplodock.compiler.trace.huggingface import build_full_model_wrapper
+    from emmy.compiler.trace.huggingface import build_full_model_wrapper
 
     dtype = torch.float16 if args.dtype == "fp16" else torch.float32
     logger.info("Loading %s (%s)...", args.model, args.dtype)

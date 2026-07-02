@@ -33,7 +33,7 @@ tests/compiler/passes/
 ├── test_masked_tile.py             # masked-tile pass (dynamic-shape boundary guard)
 ├── test_stage_inputs_classify.py   # Stage-input classifier
 ├── test_lowering_accuracy.py       # 040 / 060 / 070 + TMA end-to-end CUDA accuracy
-├── test_knob_pinning.py            # DEPLODOCK_KNOBS-pinned regression configs (article-reproduction tile/transport sweep)
+├── test_knob_pinning.py            # EMMY_KNOBS-pinned regression configs (article-reproduction tile/transport sweep)
 ├── test_warp_specialize_deadlock.py # WS=1 stranded-TMA deadlock (Qwen3 k_linear_mean_reduce) regressions
 ├── test_tile_naming.py             # provenance-driven k_<op>_<suffix> kernel naming
 └── test_pipeline_semantics.py      # full pass chain (decompose → opt → fuse) vs numpy

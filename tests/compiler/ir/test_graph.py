@@ -2,9 +2,9 @@
 
 import pytest
 
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 
 # ---- helpers ----
 
@@ -126,7 +126,7 @@ def test_to_dict_serializes_composite_shape_dim():
     inner extent, or a CatOp output) must not crash ``to_dict``: the dump path
     serializes it to its pretty expr string. Atomic dims (int / Var name) still
     return their scalar value for the ``run --ir`` round-trip."""
-    from deplodock.compiler.dim import Dim
+    from emmy.compiler.dim import Dim
 
     g = Graph()
     padded = Dim((Dim("seq_len").ceil_div(64) * 64).expr, hint=512)  # ((seq_len + 63) // 64) * 64

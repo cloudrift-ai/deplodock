@@ -2,16 +2,16 @@
 
 ## Overview
 
-All tests use **pytest** with **pytest-asyncio** (`asyncio_mode = "auto"` in `pyproject.toml`) and live in the `tests/` directory, organized into subdirectories that mirror the `deplodock/` source tree. Tests are designed to run without GPU hardware, Docker, or network access — every external interaction is avoided via dry-run mode or by testing pure functions directly.
+All tests use **pytest** with **pytest-asyncio** (`asyncio_mode = "auto"` in `pyproject.toml`) and live in the `tests/` directory, organized into subdirectories that mirror the `emmy/` source tree. Tests are designed to run without GPU hardware, Docker, or network access — every external interaction is avoided via dry-run mode or by testing pure functions directly.
 
 ## Directory Structure
 
 ```
 tests/
 ├── conftest.py              # shared fixtures
-├── test_detect.py               # deplodock.detect (GPU detection via PCI sysfs)
-├── test_hardware.py         # deplodock.hardware (top-level module)
-├── test_redact.py           # deplodock.redact (secret redaction)
+├── test_detect.py               # emmy.detect (GPU detection via PCI sysfs)
+├── test_hardware.py         # emmy.hardware (top-level module)
+├── test_redact.py           # emmy.redact (secret redaction)
 ├── test_new_models.py       # scripts/new_models.py (model discovery: base-key match, dedup, arena linking)
 ├── benchmark/
 │   ├── test_bench_dryrun.py # bench CLI dry-run
@@ -21,7 +21,7 @@ tests/
 │   ├── test_results.py      # parse_benchmark_metrics(), parse_system_info(), compose_json_result()
 │   ├── test_embedding_workload.py # embed bench command, embeddings output parsing, smoke-response checks
 │   └── test_command_workload.py # build_substitution_map(), render_command()
-├── serving/                   # mirrors deplodock/serving/ (vLLM embedding plugin)
+├── serving/                   # mirrors emmy/serving/ (vLLM embedding plugin)
 │   ├── test_packed.py       # split_spans packed-batch span splitting (pure, no GPU)
 │   └── test_vllm_plugin_gpu.py # in-process vLLM engine + plugin vs HF eager (perf-marked, CUDA + vllm)
 ├── recipe/
@@ -44,15 +44,15 @@ tests/
 │   └── test_vm_dryrun.py    # vm create/delete CLI dry-run
 ├── perf/                      # GPU perf comparison vs PyTorch (gated by `perf` marker)
 │   ├── ARCHITECTURE.md            # how to run, how to read the table, how to add a case
-│   ├── cases.py                   # curated (op, shape) cases + torch/deplodock builders
+│   ├── cases.py                   # curated (op, shape) cases + torch/emmy builders
 │   ├── conftest.py                # `bench_pair` fixture, session summary, JSON dump
 │   ├── test_primitives.py         # matmul / rmsnorm / softmax / silu_mul
 │   └── test_fused.py              # SDPA fused-kernel perf comparison
-├── compiler/                       # mirrors deplodock/compiler/
+├── compiler/                       # mirrors emmy/compiler/
 │   ├── conftest.py                     # requires_cuda / requires_sm90 markers, run_graph fixture,
 │   │                                   # device_compute_capability(), matmul_graph(m,k,n) shared builder
 │   ├── fixtures/                       # pre-computed traces (tinyllama_layer0.json)
-│   ├── ir/                             # IR datatypes (mirrors deplodock/compiler/ir/)
+│   ├── ir/                             # IR datatypes (mirrors emmy/compiler/ir/)
 │   │   ├── test_graph.py                       # Graph / Node / Tensor primitives
 │   │   ├── test_graph_splice.py                # Graph.splice rewrite primitive
 │   │   ├── test_graph_structural_key.py        # Merkle-style structural digest
@@ -77,7 +77,7 @@ tests/
 │   │   ├── test_launch_geometry_rules.py / test_masked_tile.py
 │   │   ├── test_stage_inputs_classify.py
 │   │   ├── test_lowering_accuracy.py           # 040 / 060 / 070 + TMA end-to-end
-│   │   ├── test_knob_pinning.py                # DEPLODOCK_KNOBS regression configs
+│   │   ├── test_knob_pinning.py                # EMMY_KNOBS regression configs
 │   │   ├── test_tile_naming.py                 # provenance-driven kernel naming
 │   │   └── test_pipeline_semantics.py          # full pass chain vs numpy
 │   ├── pipeline/                       # pipeline-level tests (knob, dump, rule_diff)
@@ -120,28 +120,28 @@ Test individual functions in isolation with synthetic inputs.
 |------|--------|
 | `recipe/test_types.py` | `Recipe.from_dict()`, `LLMConfig` properties (`engine_name`, `gpus_per_instance`, `image`, `extra_args`, `extra_env`, `docker_options`), dataclass defaults |
 | `recipe/test_engines.py` | `build_engine_args()`, `banned_extra_arg_flags()` — engine flag mapping, CLI argument building for vLLM and SGLang |
-| `deploy/test_recipe.py` | `deplodock.recipe.load_recipe()`, `deep_merge()`, `validate_extra_args()`, `validate_docker_options()`, `resolve_for_hardware()` — recipe loading, variant resolution, YAML parsing, extra_args validation, docker_options validation, hardware-aware matrix resolution |
+| `deploy/test_recipe.py` | `emmy.recipe.load_recipe()`, `deep_merge()`, `validate_extra_args()`, `validate_docker_options()`, `resolve_for_hardware()` — recipe loading, variant resolution, YAML parsing, extra_args validation, docker_options validation, hardware-aware matrix resolution |
 | `deploy/test_scale_out.py` | `DataParallelismScaleOutStrategy`, `ReplicaParallelismScaleOutStrategy` — scale-out strategy application, GPU count validation, immutability |
-| `deploy/test_compose.py` | `deplodock.deploy.generate_compose()`, `generate_nginx_conf()` — Docker Compose and nginx config generation, `gpu_device_ids` support, `docker_options` rendering |
-| `provisioning/test_cloud.py` | `deplodock.provisioning.cloud.resolve_vm_spec()`, `delete_cloud_vm()`, `_provision_once()`, `VMConnectionInfo` — cloud provisioning unit tests |
+| `deploy/test_compose.py` | `emmy.deploy.generate_compose()`, `generate_nginx_conf()` — Docker Compose and nginx config generation, `gpu_device_ids` support, `docker_options` rendering |
+| `provisioning/test_cloud.py` | `emmy.provisioning.cloud.resolve_vm_spec()`, `delete_cloud_vm()`, `_provision_once()`, `VMConnectionInfo` — cloud provisioning unit tests |
 | `planner/test_planner.py` | `BenchmarkTask`, `GroupByModelAndGpuPlanner` — task properties (`recipe_name`, `result_path`, `gpu_name`, `gpu_count`, `gpu_short`), grouping logic, sorting |
 | `planner/test_variant.py` | `Variant` — `__str__`, `gpu_short`, `gpu_count`, `__eq__`, `__hash__`, `_abbreviate()` |
 | `test_detect.py` | `_parse_sysfs_output()`, `detect_local_gpus()`, `detect_remote_gpus()` — PCI sysfs GPU detection, mixed GPU errors, mock SSH |
 | `test_hardware.py` | `resolve_instance_type()`, `gpu_short_name()`, `GPU_INSTANCE_TYPES` — hardware lookup tables |
-| `test_redact.py` | `deplodock.redact.redact_secrets()`, `SecretRedactingFilter`, `install_redaction()`, `register_secret()` — value-based secret redaction for text and log records, plus end-to-end propagation through a real `FileHandler` (regression test for child-logger records bypassing logger-level filters) |
+| `test_redact.py` | `emmy.redact.redact_secrets()`, `SecretRedactingFilter`, `install_redaction()`, `register_secret()` — value-based secret redaction for text and log records, plus end-to-end propagation through a real `FileHandler` (regression test for child-logger records bypassing logger-level filters) |
 | `benchmark/test_code_hash.py` | `BenchmarkTask.compute_code_hash()` — determinism, hex format |
 | `benchmark/test_run_dir.py` | `BenchmarkTask.create_run_dir()` — directory creation, naming format |
 | `benchmark/test_tasks_json.py` | `BenchmarkTask.write_tasks_json()`, `read_tasks_json()` — tasks.json round-trip |
 | `benchmark/test_results.py` | `parse_benchmark_metrics()`, `parse_system_info()`, `compose_json_result()` — structured JSON result parsing and composition |
-| `provisioning/test_cloudrift.py` | `deplodock.provisioning.cloudrift._api_request()`, `_rent_instance()`, etc. — CloudRift API helpers |
-| `provisioning/test_gcp.py` | `deplodock.provisioning.gcp._gcloud_*_cmd()` — GCP command builders |
+| `provisioning/test_cloudrift.py` | `emmy.provisioning.cloudrift._api_request()`, `_rent_instance()`, etc. — CloudRift API helpers |
+| `provisioning/test_gcp.py` | `emmy.provisioning.gcp._gcloud_*_cmd()` — GCP command builders |
 | `scripts/test_plot_mcr_sweep.py` | `load_results()` — benchmark JSON loading and sorting from `scripts/plot_mcr_sweep.py` |
 
 Unit tests use **fixtures from `conftest.py`** (`tmp_recipe_dir`, `sample_config`, `sample_config_multi`) to supply pre-built recipe directories and config dicts.
 
 ### CLI Dry-Run Tests
 
-Test the full CLI pipeline end-to-end by invoking `deplodock` as a subprocess with `--dry-run`. This exercises argument parsing, config loading, recipe resolution, and the deploy/bench orchestration — stopping just before any real side effects (SSH, Docker, file writes).
+Test the full CLI pipeline end-to-end by invoking `emmy` as a subprocess with `--dry-run`. This exercises argument parsing, config loading, recipe resolution, and the deploy/bench orchestration — stopping just before any real side effects (SSH, Docker, file writes).
 
 | File | Covers |
 |------|--------|
@@ -158,7 +158,7 @@ CLI tests use the **`run_cli` fixture** (a subprocess wrapper) and **`make_bench
 |---------|-------|---------|
 | `project_root` | session | Absolute path to repo root |
 | `recipes_dir` | session | Absolute path to `recipes/` |
-| `run_cli` | session | Callable that invokes `python -m deplodock.deplodock` as a subprocess |
+| `run_cli` | session | Callable that invokes `python -m emmy.emmy` as a subprocess |
 | `make_bench_config` | function | Factory that writes a temp `config.yaml` for bench tests (benchmark section only) |
 | `tmp_recipe_dir` | function | Temp directory with a sample `recipe.yaml` for unit tests |
 | `sample_config` | function | Single-instance vLLM config dict for compose tests |
@@ -173,7 +173,7 @@ CLI tests use the **`run_cli` fixture** (a subprocess wrapper) and **`make_bench
 - **Temp recipes** — unit tests and multi-instance edge cases create throwaway recipes via `tmp_path`.
 - **Plain functions** — no test classes; tests are grouped by file and separated with comment headers.
 - **Assertions on stdout** — dry-run tests verify that the correct commands and messages appear in the expected order.
-- **Mirror source layout** — test directories match `deplodock/` subdirectories (e.g. `tests/deploy/` ↔ `deplodock/deploy/`).
+- **Mirror source layout** — test directories match `emmy/` subdirectories (e.g. `tests/deploy/` ↔ `emmy/deploy/`).
 
 ## Running
 

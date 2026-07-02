@@ -13,12 +13,12 @@ preserves semantics without needing a GPU.
 
 import numpy as np
 
-from deplodock.compiler.backend.numpy import NumpyBackend
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.loop import Accum, Assign, LoopOp, Write
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
+from emmy.compiler.backend.numpy import NumpyBackend
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.loop import Accum, Assign, LoopOp, Write
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
+from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
 
 _backend = NumpyBackend()
 rng = np.random.default_rng(0)
@@ -113,7 +113,7 @@ def test_reduce_sum():
 
 
 def test_matmul():
-    from deplodock.compiler.ir.frontend.ir import MatmulOp
+    from emmy.compiler.ir.frontend.ir import MatmulOp
 
     g = Graph()
     _input(g, "a", (4, 8))
@@ -146,7 +146,7 @@ def test_no_matmul_when_mul_fans_out():
 
 
 def test_matmul_op_decomposes_and_fuses():
-    from deplodock.compiler.ir.frontend.ir import MatmulOp
+    from emmy.compiler.ir.frontend.ir import MatmulOp
 
     g = Graph()
     _input(g, "a", (4, 8))
@@ -218,7 +218,7 @@ def test_reduce_sum_correctness():
 
 
 def test_matmul_correctness():
-    from deplodock.compiler.ir.frontend.ir import MatmulOp
+    from emmy.compiler.ir.frontend.ir import MatmulOp
 
     def _make():
         g = Graph()

@@ -11,12 +11,12 @@ makes the post-fusion run possible without a GPU.
 
 import numpy as np
 
-from deplodock.compiler.backend.numpy import NumpyBackend
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.loop import Accum, Assign, LoopOp, Write
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, GatherOp, ReduceOp
-from deplodock.compiler.pipeline import Pipeline
+from emmy.compiler.backend.numpy import NumpyBackend
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import ConstantOp, InputOp
+from emmy.compiler.ir.loop import Accum, Assign, LoopOp, Write
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, GatherOp, ReduceOp
+from emmy.compiler.pipeline import Pipeline
 
 rng = np.random.default_rng(0)
 _backend = NumpyBackend()
@@ -109,7 +109,7 @@ def test_pointwise_chain_body_ops():
 
 
 def test_pointwise_chain_inputs_are_loads():
-    from deplodock.compiler.ir.loop import Load
+    from emmy.compiler.ir.loop import Load
 
     result = _fuse(_make_pointwise_chain())
     kernel = _kernel_nodes(result)[0]
@@ -164,7 +164,7 @@ def test_rms_norm_like_correctness():
 
 def test_rms_norm_like_ssa_names_are_canonical():
     """After rename pass, every SSA name in the body is v0, v1, v2, ... in order."""
-    from deplodock.compiler.ir.loop import Select
+    from emmy.compiler.ir.loop import Select
 
     result = _fuse(_make_rms_norm_like())
     kernel = _kernel_nodes(result)[0]
@@ -207,7 +207,7 @@ def test_contraction_body_has_mul_and_sum():
 
 
 def _make_contraction_with_epilogue():
-    from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
+    from emmy.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
 
     g = Graph()
     g.add_node(InputOp(), [], Tensor("a", (4, 8)), node_id="a")
@@ -298,7 +298,7 @@ def test_ssa_invariants_hold():
         defined = set()
         for decl in k.op.body.accums:
             defined.add(decl.name)
-        from deplodock.compiler.ir.loop import Accum, Load
+        from emmy.compiler.ir.loop import Accum, Load
 
         for s in k.op:
             if isinstance(s, Assign):
@@ -456,7 +456,7 @@ def _make_shared_const_broadcast():
     """A scalar ``const_bc(1.0)`` broadcast feeding two elementwise consumers —
     the headline case: torch.export folds attention-mask / RoPE scaffolding to
     scalar broadcasts that fan out (Qwen3 GQA query + key paths)."""
-    from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import const_bc
+    from emmy.compiler.pipeline.passes.frontend.decomposition._helpers import const_bc
 
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
@@ -505,8 +505,8 @@ def test_shared_const_broadcast_split_in_isolation():
 def _make_shared_transpose():
     """A transpose (general layout op) feeding two elementwise consumers —
     covers the non-constant pure-indexmap path."""
-    from deplodock.compiler.ir.expr import placeholder
-    from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import single_indexmap
+    from emmy.compiler.ir.expr import placeholder
+    from emmy.compiler.pipeline.passes.frontend.decomposition._helpers import single_indexmap
 
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
@@ -554,7 +554,7 @@ def test_shared_transpose_correctness():
 
 
 def _make_gather_into_reduce():
-    from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
+    from emmy.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
 
     V, H, S = 16, 8, 4
     g = Graph()
@@ -593,8 +593,8 @@ def _make_shared_broadcast_chain():
     ``Write.output`` to its new id. Forgetting that leaves the node writing the
     old buf — ``splice_graph`` (which assumes Write.output == node id) then can't
     fold it into the downstream multiply, and a pure-indexmap copy survives."""
-    from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
-    from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import const_bc
+    from emmy.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
+    from emmy.compiler.pipeline.passes.frontend.decomposition._helpers import const_bc
 
     g = Graph()
     g.add_node(InputOp(), [], Tensor("mq", (1, 3, 4, 8)), node_id="mq")

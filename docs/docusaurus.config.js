@@ -6,15 +6,15 @@ const darkCodeTheme = themes.dracula;
 
 /** @type {import('@docusaurus/types').Config} */
 const config = {
-  title: 'Deplodock',
+  title: 'Emmy',
   tagline: 'Benchmark and deploy optimized LLM models on GPU servers',
   favicon: 'img/favicon.ico',
 
-  url: 'https://deplodock.docs.cloudrift.ai',
+  url: 'https://emmy.docs.cloudrift.ai',
   baseUrl: '/',
 
   organizationName: 'CloudRift',
-  projectName: 'Deplodock',
+  projectName: 'Emmy',
 
   onBrokenLinks: 'throw',
   markdown: {
@@ -36,7 +36,7 @@ const config = {
         docs: {
           routeBasePath: '/',
           sidebarPath: require.resolve('./sidebars.js'),
-          editUrl: 'https://github.com/CloudRift/deplodock-docs',
+          editUrl: 'https://github.com/CloudRift/emmy-docs',
         },
         theme: {
           customCss: require.resolve('./src/css/custom.css'),
@@ -50,17 +50,17 @@ const config = {
     ({
       image: 'img/cloudrift-social-card.webp',
       metadata: [
-        {name: 'description', content: 'Deplodock documentation - Benchmark and deploy optimized LLM models on GPU servers with vLLM or SGLang.'},
-        {name: 'keywords', content: 'Deplodock, LLM deployment, vLLM, SGLang, GPU benchmarking, model optimization, CloudRift'},
+        {name: 'description', content: 'Emmy documentation - Benchmark and deploy optimized LLM models on GPU servers with vLLM or SGLang.'},
+        {name: 'keywords', content: 'Emmy, LLM deployment, vLLM, SGLang, GPU benchmarking, model optimization, CloudRift'},
         {property: 'og:type', content: 'website'},
-        {property: 'og:site_name', content: 'Deplodock Documentation'},
+        {property: 'og:site_name', content: 'Emmy Documentation'},
         {property: 'og:description', content: 'Benchmark and deploy optimized LLM models on GPU servers with vLLM or SGLang.'},
         {name: 'twitter:card', content: 'summary_large_image'},
-        {name: 'twitter:title', content: 'Deplodock Documentation'},
+        {name: 'twitter:title', content: 'Emmy Documentation'},
         {name: 'twitter:description', content: 'Benchmark and deploy optimized LLM models on GPU servers with vLLM or SGLang.'},
       ],
       navbar: {
-        title: 'Deplodock',
+        title: 'Emmy',
         logo: {
           alt: 'CloudRift Logo',
           src: 'img/cloudrift_vector.svg',

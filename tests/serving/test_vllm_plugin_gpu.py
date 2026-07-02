@@ -1,4 +1,4 @@
-"""In-process vLLM engine test of the deplodock embedding plugin.
+"""In-process vLLM engine test of the emmy embedding plugin.
 
 ``perf``-marked (deselected by default — run with ``pytest -m perf``): needs
 CUDA, vllm, and the Qwen3-Embedding-0.6B checkpoint, and spends ~2 min
@@ -38,7 +38,7 @@ def test_vllm_plugin_embed_matches_hf_eager(monkeypatch):
         enforce_eager=True,
         max_model_len=4096,
         gpu_memory_utilization=0.8,
-        hf_overrides={"architectures": ["DeplodockEmbedModel"]},
+        hf_overrides={"architectures": ["EmmyEmbedModel"]},
     )
     outs = llm.embed(texts)
     got = np.array([o.outputs.embedding for o in outs], dtype=np.float64)

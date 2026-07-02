@@ -1,9 +1,9 @@
 """Curated (op, shape) cases for the perf suite.
 
-Each ``Case`` describes one fused launch that Deplodock emits when
+Each ``Case`` describes one fused launch that Emmy emits when
 compiling a single Qwen3-Embedding-0.6B decoder layer at seq_len 32 /
 128 / 512. The case list mirrors the 12 kernels produced by
-``deplodock compile Qwen/Qwen3-Embedding-0.6B --layer 0`` after the
+``emmy compile Qwen/Qwen3-Embedding-0.6B --layer 0`` after the
 fusion pass, so the perf suite is an apples-to-apples view of what the
 compiler actually runs at the model level.
 
@@ -12,12 +12,12 @@ For each Case both:
 - the PyTorch reference closure (``build_torch_ref``) — eager call into
   ``torch.matmul`` / ``F.rms_norm`` / ``F.scaled_dot_product_attention``
   etc.;
-- the Deplodock graph (``build_deplodock_graph``) — a small ``Graph``
+- the Emmy graph (``build_emmy_graph``) — a small ``Graph``
   built from frontend ops that lowers to the same single fused
   kernel that comes out of the Qwen3-Embedding layer.
 
 Shapes are pinned to Qwen3-Embedding-0.6B: hidden=1024, intermediate=
-3072, num_heads=16, num_kv_heads=8, head_dim=128. Deplodock currently
+3072, num_heads=16, num_kv_heads=8, head_dim=128. Emmy currently
 emits FP32 only, so all cases run FP32 on both sides; the ``dtype``
 field is kept on ``Case`` so an FP16 column can be added later
 without touching callers.
@@ -47,15 +47,15 @@ class Case:
 
     @property
     def code(self) -> str:
-        """Inline ``deplodock run --code`` expression equivalent to this
-        case. Used by the perf bencher to drive ``deplodock run --bench
+        """Inline ``emmy run --code`` expression equivalent to this
+        case. Used by the perf bencher to drive ``emmy run --bench
         --profile`` per case so the benchmarking infra is shared with
         the CLI. Each input tensor is materialized via ``torch.randn``
         on the same shape; the final expression is what gets traced.
 
         No ``import`` preamble — the ``--code`` evaluator already binds
         ``torch`` / ``nn`` / ``F`` in scope (``commands/trace.trace_inline_code``),
-        so the string drops straight into ``deplodock run -c "<this>"``."""
+        so the string drops straight into ``emmy run -c "<this>"``."""
         s = self.shapes
         if self.op == "matmul":
             return f"a=torch.randn({s[0]}); b=torch.randn({s[1]}); torch.matmul(a,b)"
@@ -113,7 +113,7 @@ _TAG = "qwen3emb"
 # Per-kernel case builders
 #
 # The kernel ids below match the ``=== N: kernel_name ===`` blocks in
-# ``deplodock compile Qwen/Qwen3-Embedding-0.6B --layer 0 --dump-dir DIR``,
+# ``emmy compile Qwen/Qwen3-Embedding-0.6B --layer 0 --dump-dir DIR``,
 # stage ``04_loop_fusion.kernels.txt``.
 # ---------------------------------------------------------------------------
 
@@ -136,7 +136,7 @@ def _rmsnorm_layer_cases() -> list[Case]:
 
 def _rmsnorm_qknorm_cases() -> list[Case]:
     """Kernels 4 / 5 — per-head RMSNorm on Q/K with the reduce over
-    head_dim. The kernel produced by Deplodock fuses the reshape +
+    head_dim. The kernel produced by Emmy fuses the reshape +
     transpose with the norm, but the perf-relevant arithmetic is the
     rmsnorm with a head_dim-wide reduce; we test that shape directly."""
     cases: list[Case] = []
@@ -174,7 +174,7 @@ def _matmul_proj_cases() -> list[Case]:
 def _sdpa_cases() -> list[Case]:
     """Kernels 6 + 7 — masked QK (with RoPE folded in) and softmax/AV.
     ``F.scaled_dot_product_attention`` is the natural eager reference;
-    Deplodock's frontend ``SdpaOp`` decomposes and fuses into two
+    Emmy's frontend ``SdpaOp`` decomposes and fuses into two
     launches matching the Qwen3 layer."""
     cases: list[Case] = []
     for s in _SEQ_LENS:
@@ -244,7 +244,7 @@ def build_torch_ref(case: Case) -> Callable[[], None]:
     import torch.nn.functional as F
 
     device = "cuda"
-    dtype = torch.float32  # deplodock is fp32-only today
+    dtype = torch.float32  # emmy is fp32-only today
     rng = torch.Generator(device=device).manual_seed(0)
 
     def _r(shape: tuple[int, ...]) -> torch.Tensor:
@@ -284,17 +284,17 @@ def build_torch_ref(case: Case) -> Callable[[], None]:
 
 
 # ---------------------------------------------------------------------------
-# Deplodock graph builders
+# Emmy graph builders
 # ---------------------------------------------------------------------------
 
 
-def build_deplodock_graph(case: Case):
+def build_emmy_graph(case: Case):
     """Build a small ``Graph`` for the case using frontend ops; the
     compiler decomposes/fuses on its own."""
-    from deplodock.compiler.graph import Graph, Tensor
-    from deplodock.compiler.ir.base import InputOp
-    from deplodock.compiler.ir.frontend.ir import MatmulOp, RmsNormOp, SdpaOp
-    from deplodock.compiler.ir.tensor.ir import ElementwiseOp
+    from emmy.compiler.graph import Graph, Tensor
+    from emmy.compiler.ir.base import InputOp
+    from emmy.compiler.ir.frontend.ir import MatmulOp, RmsNormOp, SdpaOp
+    from emmy.compiler.ir.tensor.ir import ElementwiseOp
 
     g = Graph()
 

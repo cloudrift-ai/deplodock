@@ -8,11 +8,11 @@ inputs at the output shape — the rank-preserving Tensor IR invariant.
 
 import numpy as np
 
-from deplodock.compiler.backend.numpy import NumpyBackend
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp
-from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
+from emmy.compiler.backend.numpy import NumpyBackend
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import ConstantOp, InputOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp
+from emmy.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
 
 rng = np.random.default_rng(42)
 _backend = NumpyBackend()
@@ -120,8 +120,8 @@ def test_tracer_emits_broadcast_explicit_elementwise():
     smaller inputs in IndexMapOps via broadcast_to)."""
     import torch
 
-    from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.ir.tensor.ir import ElementwiseOp
+    from emmy.compiler.trace.torch import trace_module
 
     class BroadcastAdd(torch.nn.Module):
         def forward(self, x, y):

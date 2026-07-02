@@ -32,7 +32,7 @@ proportions flipped once the kernels were tuned.
 
 ## Current seam (what changes)
 
-`deplodock/serving/vllm_model_gen.py::DeplodockGenModel.forward` (lines 120–135), per layer:
+`emmy/serving/vllm_model_gen.py::EmmyGenModel.forward` (lines 120–135), per layer:
 
 ```
 ids → runner.embed(numpy) → hidden_np
@@ -45,7 +45,7 @@ ids → runner.embed(numpy) → hidden_np
   hidden_np = runner.final_norm(hidden_np)
 ```
 
-`deplodock/serving/gen_runner.py::_Program.run` (lines 37–48) is the host path: `rebind(numpy)` → `run_once()` →
+`emmy/serving/gen_runner.py::_Program.run` (lines 37–48) is the host path: `rebind(numpy)` → `run_once()` →
 `outputs()` (`.get()` → numpy). `forward_layer_pre/post` (lines 201–222) take/return numpy and pad→run→slice on the
 host.
 
@@ -53,11 +53,11 @@ host.
 
 The **embedding** serving path is already fully device-resident through a vLLM plugin — it is the working template:
 
-- `deplodock/serving/runner.py::DeplodockForwardRunner.forward_hidden_states` (lines 204–237): enters
+- `emmy/serving/runner.py::EmmyForwardRunner.forward_hidden_states` (lines 204–237): enters
   `cp.cuda.Stream.from_external(torch.cuda.current_stream())`, then `set_sym_values` → `upload_prefix_device` →
   `capture_program_graph` → `replay_program_graph` → `output_prefix_device`, bridging torch↔cupy with
   `cp.from_dlpack` / `torch.from_dlpack` (no host copy).
-- `CompiledProgram` already exposes every device API we need (`deplodock/compiler/backend/cuda/program.py`):
+- `CompiledProgram` already exposes every device API we need (`emmy/compiler/backend/cuda/program.py`):
   `set_sym_values` (797), `upload_prefix_device` (951), `capture_program_graph` (870, per-`sym_values` LRU cache),
   `replay_program_graph` (925), `output_prefix_device` (1089). Capture runs on a side stream; replay on the current
   stream; graphs bake grids/pointers per `sym_values`.
@@ -90,8 +90,8 @@ flagged each):
   `from_model`/serving init (`.to(device)`), run it on the CUDA hidden tensor. Keep the CPU module for the oracle.
 - **`vllm_model_gen.py::forward`**: branch on `T = input_ids.shape[0]`. `T ≤ bucket` → device path end-to-end (no
   `.cpu().numpy()`): q/k/v and attn_out stay CUDA tensors through RoPE + `attn[layer]`, wrapped in the external-stream
-  context so deplodock replays and vLLM's attention enqueue in order. `T > bucket` → the existing host path, unchanged.
-- Keep all numpy methods for the `deplodock generate` oracle / CPU tests.
+  context so emmy replays and vLLM's attention enqueue in order. `T > bucket` → the existing host path, unchanged.
+- Keep all numpy methods for the `emmy generate` oracle / CPU tests.
 
 Expected: removes the 2.72 ms host/dispatch from the decode step (6.79 → ~4.3 ms runner) and, captured-replayed, trims
 per-program dispatch. Served single-stream target ~**100–120 tok/s** (gap ~2.3–2.7×). `--enforce-eager` stays.
@@ -127,10 +127,10 @@ After merging `main` (the flash/monoid tile-lowering dissolution, #272–#279), 
 
 ### Phase B — drop `--enforce-eager` / whole-step capture (the big lever, higher risk)
 
-Once device-resident, let vLLM's CUDA-graph machinery capture the whole `model.forward` (deplodock kernels + vLLM
+Once device-resident, let vLLM's CUDA-graph machinery capture the whole `model.forward` (emmy kernels + vLLM
 attention) so the ~5 ms eager framework cost disappears.
 
-- **Pre-capture, then replay-only.** vLLM stream-captures `model.forward`; deplodock must NOT do its own
+- **Pre-capture, then replay-only.** vLLM stream-captures `model.forward`; emmy must NOT do its own
   begin/end-capture inside that (nested capture conflict). So capture each per-layer program's graph **once at warmup**
   (outside vLLM's capture), and have the steady-state forward issue **only** `replay_program_graph()` (a `graph.launch`,
   which is capturable as a child node).
@@ -151,7 +151,7 @@ Expected: removes the eager framework penalty; served single-stream target ~**18
   or cleanly fall back. May motivate multi-bucket (8/32/…) keyed to vLLM's capture set.
 - **Memory:** capturing per-layer graphs (already up to 4 programs/layer) over capacity buffers — confirm the footprint
   on top of vLLM's allocator (Top-risk #9 already bit us; we capped `--max-num-batched-tokens` to fit 16 GB).
-- **Correctness:** the device path must stay token-for-token vs the numpy oracle (`deplodock generate`) — the existing
+- **Correctness:** the device path must stay token-for-token vs the numpy oracle (`emmy generate`) — the existing
   GPU plugin tests are the gate.
 - **bf16 seam:** unchanged (fp16 forced); not in scope.
 
@@ -167,5 +167,5 @@ Phase A is self-contained and shippable on its own; Phase B is a separate PR gat
 
 ## Out of scope
 
-Standalone serving with deplodock's own KV cache + incremental-attention kernel (the eventual standalone-serving phase)
+Standalone serving with emmy's own KV cache + incremental-attention kernel (the eventual standalone-serving phase)
 — that removes the vLLM interleave entirely and is a much larger effort. This doc stays within the vLLM-plugin design.

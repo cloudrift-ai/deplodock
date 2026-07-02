@@ -2,7 +2,7 @@
 
 import pytest
 
-from deplodock.recipe.matrix import (
+from emmy.recipe.matrix import (
     _expand_cross,
     _expand_zip,
     build_override,

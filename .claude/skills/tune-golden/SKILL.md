@@ -1,20 +1,20 @@
 ---
 name: tune-golden
-description: Use this skill when the user asks to "tune the goldens", "update the golden configs", "re-tune the goldens", "run the golden sweep", "refresh golden matmul configs", "evaluate goldens and update", "tune/seed the dynamic goldens", or otherwise wants to re-tune the GOLDEN_CONFIGS matmul shapes (static and dynamic/.dynM symbolic-axis entries alike), A/B the greedy pick against the recorded golden, and record genuine improvements into the per-GPU golden YAML. Tunes the whole golden dataset, benches greedy-vs-golden per shape with `deplodock tune` / `run --bench`, categorizes (better → replace, same → add, worse → leave), edits the goldens YAML by hand, and writes a findings report to plans/ — unlike tune-model, the target config is known here, so the report analyzes the analytic/learned prior's expectation against it (rank, per-knob misses, recommendations) plus workflow notes.
+description: Use this skill when the user asks to "tune the goldens", "update the golden configs", "re-tune the goldens", "run the golden sweep", "refresh golden matmul configs", "evaluate goldens and update", "tune/seed the dynamic goldens", or otherwise wants to re-tune the GOLDEN_CONFIGS matmul shapes (static and dynamic/.dynM symbolic-axis entries alike), A/B the greedy pick against the recorded golden, and record genuine improvements into the per-GPU golden YAML. Tunes the whole golden dataset, benches greedy-vs-golden per shape with `emmy tune` / `run --bench`, categorizes (better → replace, same → add, worse → leave), edits the goldens YAML by hand, and writes a findings report to plans/ — unlike tune-model, the target config is known here, so the report analyzes the analytic/learned prior's expectation against it (rank, per-knob misses, recommendations) plus workflow notes.
 version: 0.3.0
 ---
 
 # Evaluate and update the golden matmul configs
 
-The golden set (`deplodock/compiler/pipeline/search/goldens/<gpu>.yaml`, e.g. `rtx5090_sm120.yaml`) is the
-deployable-latency ground truth: per shape, the best-known knobs + the deplodock-vs-cuBLAS latencies. This skill
+The golden set (`emmy/compiler/pipeline/search/goldens/<gpu>.yaml`, e.g. `rtx5090_sm120.yaml`) is the
+deployable-latency ground truth: per shape, the best-known knobs + the emmy-vs-cuBLAS latencies. This skill
 re-tunes every shape, checks whether the current deployable greedy pick beats the recorded golden, records the real
 wins, and writes a findings report to `plans/` — which shapes the search/prior couldn't reach, why, what to do about
 it, and how this workflow itself could improve.
 
 What sets this apart from the `tune-model` skill: here the **target config is known** (the recorded golden), so the
 analysis can evaluate the *expectation* directly — where the golden ranks under the analytic and learned priors, which
-knobs the greedy pick misses, and whether the search ever measured it. Use the `deplodock` CLI for all of it (`tune`,
+knobs the greedy pick misses, and whether the search ever measured it. Use the `emmy` CLI for all of it (`tune`,
 `run --bench --golden/--ab`, the `eval` views) — no ad-hoc bench scripts or hand-written SQL.
 
 Requires a CUDA GPU. The whole sweep is ~30 min (23 shapes). Goldens are **hand-maintained YAML** — never dump them with
@@ -27,7 +27,7 @@ reboots (unlike `/tmp`) and the sweep stays reproducible later.
 ## Step 1 — Tune the whole golden dataset
 
 ```
-deplodock tune --dataset golden --clean 2>&1 | tee _tune/golden-sweep-<gpu>/tune.log
+emmy tune --dataset golden --clean 2>&1 | tee _tune/golden-sweep-<gpu>/tune.log
 ```
 
 This tunes every golden shape in one in-process loop (`handle_tune` over `_tune_targets` — the same codepath as a
@@ -40,7 +40,7 @@ clears the DB + prior once up front, then accumulates across shapes. Narrow with
 For each shape, run the deployable comparison:
 
 ```
-deplodock run --bench --golden NAME
+emmy run --bench --golden NAME
 ```
 
 The kernel table shows the **greedy pick** row (what `run`/`compile` deploy) and one `golden NAME` row per recorded
@@ -49,8 +49,8 @@ Compare the greedy `us` against the *best* (min) golden row's `us`.
 
 The same `run --bench` also prints a `Backend … vs Eager` latency table above the kernel table: the **`Eager
 PyTorch`** row is the live cuBLAS reference (SGEMM for fp32 — `allow_tf32=False`, HGEMM for `*.fp16`), and `vs Eager`
-is `eager_us / deplodock_us` (>1 = deplodock faster than PyTorch, <1 = slower). Note that eager number — it is the
-deplodock-vs-PyTorch/cuBLAS comparison the report surfaces (Step 7), and it is also the live cross-check on the
+is `eager_us / emmy_us` (>1 = emmy faster than PyTorch, <1 = slower). Note that eager number — it is the
+emmy-vs-PyTorch/cuBLAS comparison the report surfaces (Step 7), and it is also the live cross-check on the
 shape's recorded `cublas_us` (which is config-independent, so the two should agree within noise).
 
 ## Step 3 — Categorize each shape
@@ -67,7 +67,7 @@ Using the live A/B (greedy vs best golden row, same run):
 The `golden NAME` row is a *live re-bench*, and it swings ~10–13% run-to-run for the smaller shapes. So a marginal
 "better" (<~13%) can be the golden benching slow this run, not a real greedy win. Before recording any win:
 
-- Re-run `deplodock run --bench --golden NAME` once or twice; only record wins that reproduce clearly above the ~10–13%
+- Re-run `emmy run --bench --golden NAME` once or twice; only record wins that reproduce clearly above the ~10–13%
   noise band. Treat <~5% deltas as noise (no change).
 
 ## Step 5 — Edit the goldens YAML
@@ -81,13 +81,13 @@ Open the per-GPU file (`goldens/<gpu>.yaml`). Each entry is:
     N: 2048
     K: 1024
     knobs: {BN: 16, BM: 8, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 1, BR: 1, STAGE: '11', RING: 3}
-    deplodock_us: 18.4
+    emmy_us: 18.4
     cublas_us: 20.9
 ```
 
 When recording a config:
 
-- **`deplodock_us`** — the greedy pick's `us` from the **-O3** A/B (`run --bench`), not the -O1 tune ranking pass.
+- **`emmy_us`** — the greedy pick's `us` from the **-O3** A/B (`run --bench`), not the -O1 tune ranking pass.
 - **`cublas_us`** — reuse the shape's existing value. cuBLAS is the config-independent torch reference (true-fp32 SGEMM
   for fp32 shapes, HGEMM for `*.fp16`), so it doesn't change when our knobs change. The derived `ratio` / `golden` flag
   recompute from the two latencies.
@@ -96,7 +96,7 @@ When recording a config:
   PIPELINE_STAGES, ASYNC_COPY, PAD_SMEM, HOIST_COMPUTE, NOATOMIC, VECTORIZE_LOADS, PERMUTE_LANES, INTERLEAVE_LOADS) and
   the `S_*` / `H_*` feature columns.
 - A shape with the **same knobs** as an existing entry but a faster `us` is a codegen win — just lower that entry's
-  `deplodock_us`, don't add a duplicate.
+  `emmy_us`, don't add a duplicate.
 
 ### Pruning
 
@@ -117,7 +117,7 @@ the `dynamic:` block; `M` doubles as the hint, and the name carries a `.dynM` su
     K: 1024
     dynamic: {seq_len: {input: x0, axis: 0}}
     knobs: {BN: 32, BM: 8, FM: 8, FN: 4, FK: 1, BK: 64, SPLITK: 1, BR: 1, STAGE: '11', RING: 2}
-    deplodock_us: 52.0
+    emmy_us: 52.0
     cublas_us: 53.5
 ```
 
@@ -137,9 +137,9 @@ Everything in steps 1–7 applies unchanged — the spec is **part of the config
   the hint-shaped torch reference, so the ratio is apples-to-apples *at the hint*. Knob comparisons work exactly as
   for static shapes.
 - **Seeding a new dynamic shape** (no recorded entry yet): tune + bench via the snippet + an explicit spec —
-  `deplodock tune -c "<matmul snippet>" --dynamic seq_len@x0:0` (accumulate into the existing DB/prior — no
-  `--clean`), then `deplodock run --bench -c "<snippet>" --dynamic seq_len@x0:0`; record the greedy kernel's -O3
-  `us` as `deplodock_us`, the same run's eager row as `cublas_us`, and the table's search knobs. `x0` is the
+  `emmy tune -c "<matmul snippet>" --dynamic seq_len@x0:0` (accumulate into the existing DB/prior — no
+  `--clean`), then `emmy run --bench -c "<snippet>" --dynamic seq_len@x0:0`; record the greedy kernel's -O3
+  `us` as `emmy_us`, the same run's eager row as `cublas_us`, and the table's search knobs. `x0` is the
   snippet's lhs `(M,K)`; only the M axis may be symbolic (symbolic K is future work and the schema rejects it).
 - `eval prior --dataset golden` prints a per-shape `SKIPPED: no tuned rows` line for any golden (dynamic or static)
   whose shape has no tuned data — a `.dynM` entry skipping there means the symbolic shape was never tuned, not that
@@ -153,13 +153,13 @@ Everything in steps 1–7 applies unchanged — the spec is **part of the config
 ## Step 6 — Validate
 
 ```
-deplodock/../venv/bin/pytest tests/compiler/test_golden_configs.py -q
+emmy/../venv/bin/pytest tests/compiler/test_golden_configs.py -q
 ```
 
 This loads every YAML and checks the schema + derived properties. Spot-check a few entries:
 
 ```
-./venv/bin/python -c "from deplodock.compiler.pipeline.search.golden import goldens_by_name; \
+./venv/bin/python -c "from emmy.compiler.pipeline.search.golden import goldens_by_name; \
 print(goldens_by_name('square.512'))"
 ```
 
@@ -175,22 +175,22 @@ density of the `tune-model` reports (`plans/*-tune-findings.md`; executed ones a
 - **Per-shape outcome table**: shape name, greedy µs, best-golden µs, ratio (greedy/best-golden), category, **and a
   cuBLAS comparison when an estimate is available** — a `cuBLAS µs` column (the shape's recorded `cublas_us`, or the
   live `Eager PyTorch` row from the same `run --bench`) and a `vs cuBLAS` column (`greedy_us / cublas_us`, so >1.0 =
-  deplodock slower than PyTorch/cuBLAS — the "loser" view). Leave the two cuBLAS cells blank for any shape with no
-  estimate (e.g. a kernel kind that has no cuBLAS analogue). This makes the absolute deplodock-vs-PyTorch gap visible
+  emmy slower than PyTorch/cuBLAS — the "loser" view). Leave the two cuBLAS cells blank for any shape with no
+  estimate (e.g. a kernel kind that has no cuBLAS analogue). This makes the absolute emmy-vs-PyTorch gap visible
   per shape, not just the relative greedy-vs-golden delta — a shape can win the golden A/B yet still trail cuBLAS
-  (e.g. the fp16 squares: greedy beats a stale scalar golden 3× but is still ~0.6× cuBLAS HGEMM). All deplodock /
+  (e.g. the fp16 squares: greedy beats a stale scalar golden 3× but is still ~0.6× cuBLAS HGEMM). All emmy /
   golden numbers from the -O3 `run --bench` A/B, never the -O1 tune DB.
 - **One `## Finding N — <title>` per prior shortfall**, ordered by how far the pick lands from the golden. The
   "worse" shapes (greedy >3% slower) are the findings: the search/prior failed to reach a config it was literally
   shown. For each, gather the evidence:
-  - `deplodock eval golden --kernel <SUBSTR>` — the per-knob `found/golden` diff: *which* knobs the greedy pick got
+  - `emmy eval golden --kernel <SUBSTR>` — the per-knob `found/golden` diff: *which* knobs the greedy pick got
     wrong.
-  - `deplodock eval analytic --kernel <SUBSTR>` — the golden's rank under the cold `AnalyticPrior` over the full
+  - `emmy eval analytic --kernel <SUBSTR>` — the golden's rank under the cold `AnalyticPrior` over the full
     enumeration. A deep rank here is the "poor analytic heuristic on this config" signal: the hand-coded weights
     misprice this shape, and patience can't reach it cold.
-  - `deplodock eval prior --dataset golden --kernel <SUBSTR>` — the rank under the *learned* prior + the `vs gold`
+  - `emmy eval prior --dataset golden --kernel <SUBSTR>` — the rank under the *learned* prior + the `vs gold`
     -O3 perf column. Deep analytic rank but shallow learned rank → the heuristic is the problem, not the search.
-  - `deplodock eval variants --kernel <SUBSTR>` — was the golden config ever *measured* this sweep (reachability),
+  - `emmy eval variants --kernel <SUBSTR>` — was the golden config ever *measured* this sweep (reachability),
     and where the deployed pick ranks among measured variants.
   - **Before calling a knob mismatch a search shortfall**, check the `-O3 us` column in `eval variants` or run one
     `run --bench --ab "<golden knobs>"` A/B: -O1 ranking flags often invert at -O3, so an apparent pick miss can be

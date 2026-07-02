@@ -1,6 +1,6 @@
-"""Unit tests for the common GPU registry (:mod:`deplodock.gpu`)."""
+"""Unit tests for the common GPU registry (:mod:`emmy.gpu`)."""
 
-from deplodock import gpu
+from emmy import gpu
 
 
 def test_lookup_by_name_and_pci():
@@ -93,7 +93,7 @@ def test_hardware_id_distinguishes_same_die_skus(monkeypatch):
     """``Context.hardware_id`` keys on the product name when known — so H100 and H200
     (identical cc + SM features) get distinct identities; an unnamed context falls back
     to a device-regime digest. And ``features()`` carries ``H_total_mem``."""
-    from deplodock.compiler.context import Context
+    from emmy.compiler.context import Context
 
     h100 = Context.from_target((9, 0), gpu_name="NVIDIA H100 80GB")
     h200 = Context.from_target((9, 0), gpu_name="NVIDIA H200 141GB")

@@ -8,12 +8,12 @@ arg order, or external-buffer names must produce the same key.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.stmt.blocks import Loop
-from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import Assign, Load, Write
-from deplodock.compiler.ir.stmt.normalize import (
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.stmt.blocks import Loop
+from emmy.compiler.ir.stmt.body import Body
+from emmy.compiler.ir.stmt.leaves import Assign, Load, Write
+from emmy.compiler.ir.stmt.normalize import (
     canonicalize_buffer_names,
     normalize_body,
     sort_commutative_args,

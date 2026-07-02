@@ -3,14 +3,14 @@
 These are pure-data checks (no GPU): the records load from the per-GPU YAML files,
 the derived ``ratio`` / ``golden`` properties stay consistent, and ``matmul_snippet``
 / ``repro_command`` render the canonical form. The actual latencies are measured on
-a CUDA device via ``deplodock tune --golden NAME --bench`` and recorded into the YAML.
+a CUDA device via ``emmy tune --golden NAME --bench`` and recorded into the YAML.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.pipeline.search.golden import (
+from emmy.compiler.pipeline.search.golden import (
     _GOLDENS_DIR,
     _KERNEL_CLASSES,
     GOLDEN_CONFIGS,
@@ -34,11 +34,11 @@ def test_matmul_snippet_typed():
 
 
 @pytest.mark.parametrize(
-    ("deplodock_us", "cublas_us", "ratio", "golden"),
+    ("emmy_us", "cublas_us", "ratio", "golden"),
     [(100.0, 99.0, 0.99, True), (100.0, 95.0, 0.95, True), (100.0, 80.0, 0.80, False), (0.0, 99.0, 0.0, False)],
 )
-def test_ratio_and_golden_derive(deplodock_us, cublas_us, ratio, golden):
-    c = GoldenConfig(name="t", deplodock_us=deplodock_us, cublas_us=cublas_us)
+def test_ratio_and_golden_derive(emmy_us, cublas_us, ratio, golden):
+    c = GoldenConfig(name="t", emmy_us=emmy_us, cublas_us=cublas_us)
     assert c.ratio == pytest.approx(ratio)
     assert c.golden is golden
 
@@ -46,7 +46,7 @@ def test_ratio_and_golden_derive(deplodock_us, cublas_us, ratio, golden):
 def test_repro_command_round_trips_knobs_and_snippet():
     c = MatmulGoldenConfig(name="square.2048", M=2048, N=2048, K=2048, knobs={"TILE": "n32x8/f4x26", "STAGE": "d2/tma"})
     cmd = c.repro_command()
-    assert 'DEPLODOCK_KNOBS="TILE=n32x8/f4x26,STAGE=d2/tma"' in cmd
+    assert 'EMMY_KNOBS="TILE=n32x8/f4x26,STAGE=d2/tma"' in cmd
     assert c.snippet() in cmd
     assert "--ir cuda" in cmd
 
@@ -58,14 +58,14 @@ def test_golden_configs_set_is_well_formed():
         if isinstance(c, MatmulGoldenConfig):
             assert c.M > 0 and c.N > 0 and c.K > 0, c.name
         elif isinstance(c, ReduceGoldenConfig):
-            from deplodock.compiler.ir.schedule import ReducePlan
+            from emmy.compiler.ir.schedule import ReducePlan
 
             assert c.M > 0 and c.K > 0, c.name
             coop = ReducePlan.parse(c.knobs.get("REDUCE")).coop
             assert coop > 1, f"{c.name} reduce golden must be cooperative (REDUCE coop>1, got {coop})"
         else:
             assert c.M > 0 and c.N > 0, c.name
-        assert c.deplodock_us > 0 and c.cublas_us > 0, c.name
+        assert c.emmy_us > 0 and c.cublas_us > 0, c.name
         assert c.ratio >= 0.0, c.name
         assert c.golden == (c.ratio >= 0.95), c.name
         assert c.knobs, f"{c.name} has no recorded knobs"
@@ -96,8 +96,8 @@ def test_goldens_speak_native_codecs_and_featurize():
     codecs (no legacy GEMM-letter vocabulary survives), and every **matmul** golden featurizes to a
     non-empty tile geometry family — the scalar path that silently produced empty ``D_*`` features
     while the goldens still spelled ``BM``/``BN`` (the bug the migration fixed)."""
-    from deplodock.compiler.ir.schedule import ReducePlan, Stage, TilePlan
-    from deplodock.compiler.pipeline.search import features
+    from emmy.compiler.ir.schedule import ReducePlan, Stage, TilePlan
+    from emmy.compiler.pipeline.search import features
 
     legacy = {"BN", "BM", "FM", "FN", "BK", "BR", "FK", "SPLITK", "WN", "WM", "MMA", "RING", "TMA"}
     for g in GOLDEN_CONFIGS:
@@ -165,7 +165,7 @@ def test_dynamic_golden_hint_must_equal_default_seq_hint():
     """The pipeline tiles/benches a symbolic axis at the global ``DEFAULT_SEQ_HINT``,
     not the traced M — an M=1024 dynamic golden would silently be measured at 512
     and duplicate the (N, K, hint-512) shape. Rejected until per-Dim hints exist."""
-    from deplodock.compiler.dim import DEFAULT_SEQ_HINT
+    from emmy.compiler.dim import DEFAULT_SEQ_HINT
 
     with pytest.raises(ValueError, match="DEFAULT_SEQ_HINT"):
         _dyn({"seq_len": {"input": "x0", "axis": 0}}, M=1024)
@@ -181,7 +181,7 @@ def test_dynamic_is_matmul_only():
 
 
 def test_sample_from_golden_carries_dynamic_specs():
-    from deplodock.compiler.pipeline.search.data import Sample
+    from emmy.compiler.pipeline.search.data import Sample
 
     dyn = Sample.from_golden(_dyn({"seq_len": {"input": "x0", "axis": 0}}))
     assert dyn.dynamic == ("seq_len@x0:0",)
@@ -201,13 +201,13 @@ def test_shape_key_carries_dynamic_flag():
 
 
 def _dup(knobs, us):
-    return MatmulGoldenConfig(name="dup.512", M=512, N=512, K=512, knobs=knobs, deplodock_us=us, cublas_us=14.0)
+    return MatmulGoldenConfig(name="dup.512", M=512, N=512, K=512, knobs=knobs, emmy_us=us, cublas_us=14.0)
 
 
 def test_goldens_by_name_returns_every_config_under_a_name(monkeypatch):
     """A name may carry several configs (e.g. a newly found faster variant beside
     the old one); ``goldens_by_name`` returns them all, empty for an unknown name."""
-    from deplodock.compiler.pipeline.search import golden as gmod
+    from emmy.compiler.pipeline.search import golden as gmod
 
     a, b = _dup({"TILE": "n16x8/f2x2"}, 12.0), _dup({"TILE": "n16x8/f4x4"}, 14.0)
     monkeypatch.setattr(gmod, "GOLDEN_CONFIGS", [a, b])
@@ -221,13 +221,13 @@ def test_resolve_golden_arg_stashes_all_matches(monkeypatch):
     is the snippet of the first); no ``--golden`` leaves an empty list."""
     from argparse import Namespace
 
-    from deplodock.compiler.pipeline.search import golden as gmod
+    from emmy.compiler.pipeline.search import golden as gmod
 
     a, b = _dup({"TILE": "n16x8/f2x2"}, 12.0), _dup({"TILE": "n16x8/f4x4"}, 14.0)
     # Dataset.from_golden reads golden.GOLDEN_CONFIGS via a lazy import, so this patch is seen.
     monkeypatch.setattr(gmod, "GOLDEN_CONFIGS", [a, b])
 
-    from deplodock.commands import compile as cmod
+    from emmy.commands import compile as cmod
 
     args = Namespace(golden="dup.512", code=None, input=None, ir=None)
     cmod.resolve_golden_arg(args)
@@ -247,8 +247,8 @@ def test_resolve_golden_arg_applies_dynamic_spec(monkeypatch):
     part of the config, the same way ``--ir`` rejects it."""
     from argparse import Namespace
 
-    from deplodock.commands import compile as cmod
-    from deplodock.compiler.pipeline.search import golden as gmod
+    from emmy.commands import compile as cmod
+    from emmy.compiler.pipeline.search import golden as gmod
 
     dyn = MatmulGoldenConfig(
         name="dup.512.dynM",
@@ -256,7 +256,7 @@ def test_resolve_golden_arg_applies_dynamic_spec(monkeypatch):
         N=512,
         K=512,
         knobs={"TILE": "n16x8/f2x2"},
-        deplodock_us=12.0,
+        emmy_us=12.0,
         cublas_us=14.0,
         dynamic={"seq_len": {"input": "x0", "axis": 0}},
     )
