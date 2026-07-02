@@ -263,6 +263,11 @@ def knob_features(knobs: dict) -> dict[str, float]:
     feats.setdefault("MMA_tier", 0.0)  # scalar tier / no schedule node = no warp atom
     if "PLACE@cone" in knobs:  # the demoted-matmul cut's round-trip cost axis (only at offer sites)
         feats.update(_cut_features(knobs))
+    if "PLACE@fold" in knobs:  # the downstream-fold placement (flash fuse vs multi-kernel attention)
+        # Present only at offer sites (absent = the prior's "not considered"). The cut's
+        # materialized-score volume / fused-carrier-width terms need per-operand shape stamping
+        # the coarse S_ext_* skeleton lacks — the same deferral as the cone's precise terms.
+        feats["D_fold_cut"] = 1.0 if str(knobs["PLACE@fold"]) == "cut" else 0.0
     return feats
 
 

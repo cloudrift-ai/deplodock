@@ -374,12 +374,11 @@ def _tile_rows(kernel, place) -> tuple[list[dict], str]:
                 needs_split = bool(red) and ReducePlan.parse(red).needs_split
                 if needs_split and stage:
                     continue  # split partials are gmem-direct (030_split drops the stage) — no staged split rows
-                row = {_at(TILE, kaxis): spec}
-                if stage:
-                    row[_at(STAGE, kaxis)] = stage
-                if red:
-                    row[_at(REDUCE, kaxis)] = red
-                rows.append(row)
+                # Every family key is explicit — ``""`` is a DECIDED empty (per-cell / serial /
+                # gmem-direct), distinguishable from an absent (never-offered) family. The
+                # evidence pick's prefix-consistency depends on it: an absent key reads as
+                # "free" and would let a gmem-direct leaf inherit a staged row's measurement.
+                rows.append({_at(TILE, kaxis): spec, _at(STAGE, kaxis): stage, _at(REDUCE, kaxis): red})
     return rows, kaxis
 
 
@@ -440,8 +439,9 @@ def _stage_spec(kernel) -> str:
 # :class:`Stage` (or ``None``, gmem-direct) is stamped on the ``TileOp``. The materializer
 # (``_atom._staged``) applies it verbatim, deciding nothing — the same stamp-then-apply shape as the
 # reduce tier's shared-row stage (:func:`_row_stage`). ``knobs`` carries the RESOLVED spelling
-# (``Stage.spell()``), and nothing when resolution declines — the DB row / feature vector describes
-# the pipeline the kernel actually has, never the pin as requested.
+# (``Stage.spell()``), and the explicit OFF value ``""`` when resolution declines — the DB row /
+# feature vector describes the pipeline the kernel actually has, never the pin as requested (and
+# a decided-empty is spelled, so the evidence pick can tell it from a never-offered family).
 
 
 def _can_stage_warp(stage, k_axis: Axis, tile_m: int, tile_n: int, bk: int, atom_k: int, mask_m: bool, mask_n: bool, b_trans: bool) -> bool:
@@ -654,7 +654,7 @@ def _splitk_option(tile, place, tile_spec: str, split_spec: str, name: str, knob
     # No STAGE on a split-K kernel: ``030_split`` drops ``stage`` from its partial ``TileOp``s (the
     # partials are gmem-direct), so resolving/stamping a pin here would record a pipeline no kernel
     # has. Threading the stage through the split is a follow-up; the stamp returns with it.
-    stamped = {**knobs, _at(TILE, kaxis): tile_spec, _at(REDUCE, kaxis): split_spec}
+    stamped = {**knobs, _at(TILE, kaxis): tile_spec, _at(REDUCE, kaxis): split_spec, _at(STAGE, kaxis): ""}
     return TileOp(op=op, name=name, place=place, tier=inner.tile, knobs=stamped)
 
 
@@ -680,10 +680,11 @@ def _warp_option(tile, place, spec: str, name: str, knobs: dict, stage_spec: str
     kaxis = op.k_axis.name
     stamped = {**knobs, _at(TILE, kaxis): spec}
     # Honest stamping: the RESOLVED spelling (depth clamps, dropped ring) — the DB row / feature
-    # vector must describe the pipeline the kernel actually has. A declined resolution (gmem-direct)
-    # stamps nothing, so the row is indistinguishable from an unpinned gmem-direct kernel.
-    if stage is not None:
-        stamped[_at(STAGE, kaxis)] = stage.spell()
+    # vector must describe the pipeline the kernel actually has. A declined / absent stage stamps
+    # the explicit OFF value ``""`` (decided: gmem-direct), never the raw pin — and never nothing:
+    # an absent family key means "not offered", and the evidence pick's prefix-consistency reads an
+    # absent key as free, letting a gmem-direct leaf inherit a STAGED row's measurement.
+    stamped[_at(STAGE, kaxis)] = stage.spell() if stage is not None else ""
     if wspec_spec:
         stamped[WSPEC.name] = wspec_spec
     return TileOp(op=op, name=name, place=place, tier=wt, stage=stage, workers=workers, knobs=stamped)
@@ -736,11 +737,8 @@ def _tile_option(tile, place, spec: str, name: str, knobs: dict, reduce_spec: st
     # unifying the schedule onto the axis-named family. STAGE stamps the RESOLVED spelling, and only
     # when resolution took (see ``_warp_option`` — the same honest-stamping rule).
     kaxis = reduce_loop(tile.op).axis.name
-    stamped = {**knobs, _at(TILE, kaxis): spec}
-    if reduce_spec:
-        stamped[_at(REDUCE, kaxis)] = reduce_spec
-    if stage is not None:
-        stamped[_at(STAGE, kaxis)] = stage.spell()
+    stamped = {**knobs, _at(TILE, kaxis): spec, _at(REDUCE, kaxis): reduce_spec}
+    stamped[_at(STAGE, kaxis)] = stage.spell() if stage is not None else ""
     return TileOp(op=op, name=name, place=place, tier=plan, stage=stage, knobs=stamped)
 
 
@@ -795,17 +793,19 @@ def schedule(tile: TileOp, name: str, knobs: dict) -> Fork | list[TileOp] | Tile
         levels = [_level(_at(k, kaxis)) for k in (TILE, STAGE, REDUCE)]
         return build_fork_tree(params=rows, levels=levels, materialize=_materialize)
     # A TWISTED streaming reduce whose per-step partial is a contraction pair takes the WARP
-    # (fragment-resident) tier when the mma atom is eligible — the conservative deterministic pick,
-    # like the coop constants above (the tensor-core stream strictly dominates the redundant
-    # per-cell scalar recompute). An explicit ``REDUCE`` pin is the scalar escape: it asks for a
-    # reduce partition, which only the scalar tiers honor.
+    # (fragment-resident) tier when the mma atom is eligible, then the scalar register-vector CHAIN
+    # (the FA-2 shared-score form) when the column axis fits the register budget — DETERMINISTIC
+    # conservative picks, not fork siblings: the e2e contract pins these as the cold unpinned
+    # schedules, and the cold AnalyticPrior cannot yet rank structurally-different flash forms
+    # (a featureless serial row scores the neutral 1.0 against a featured warp/chain row — the
+    # asymmetry would flip the pick per shape). Offering warp/chain/coop/serial as one prior-ranked
+    # fork is the anticipated follow-up gated on the AnalyticPrior cold-start refit; the ``REDUCE``
+    # pin stays the scalar escape (it asks for a reduce partition, which only the scalar tiers
+    # honor).
     if not REDUCE.narrow([""])[0]:
         warp = _twisted_warp_option(tile, name, knobs)
         if warp is not None:
             return warp
-        # The warp tier didn't take a TWISTED contraction pair — the scalar register-vector CHAIN
-        # (the FA-2 shared-score form) is the next conservative pick when the column axis fits the
-        # register budget.
         chain = _twisted_chain_option(tile, place, name, knobs)
         if chain is not None:
             return chain
@@ -878,7 +878,11 @@ def _twisted_chain_option(tile: TileOp, place, name: str, knobs: dict) -> TileOp
     partial = tuple(pv2 if st is pv else st for st in red.partial)
     red2 = replace(red, partial=type(red.partial)(partial))
     op2 = replace(op, source=red2) if isinstance(op, Map) else red2
-    return TileOp(op=op2, name=name, place=Placement(free=tile.place.free, grid=tuple(grid[:-1])), knobs=knobs)
+    # The chain is now a fork SIBLING of the warp / reduce-partition schedules, so its resolved
+    # register-vector plan is stamped (keyed on the PV contraction's k axis, like every per-node
+    # schedule codec) — the row identity the DB / prior separate it from the per-cell serial by.
+    stamped = {**knobs, _at(TILE, pv.k_axis.name): pv2.tile.spell()}
+    return TileOp(op=op2, name=name, place=Placement(free=tile.place.free, grid=tuple(grid[:-1])), knobs=stamped)
 
 
 def _demoted_warp_option(tile: TileOp, place, name: str, knobs: dict) -> TileOp | None:

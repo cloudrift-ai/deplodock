@@ -218,9 +218,9 @@ def scalar_tile_moves() -> list[str]:
 # golden sweeps have deployed (≤ 4 warps, ``FM·FN ≤ 32`` C-fragment cells, shallow pipelined bk).
 # Per-node legality — the atom's operand dtype and the ``_check_warp_static_k`` K-divisibility —
 # is the scheduler's (``_schedule``), not the grid's.
-_WARP_UNITS: tuple[tuple[int, int], ...] = ((1, 1), (2, 1), (1, 2), (2, 2), (4, 1), (1, 4))  # (WM, WN)
+_WARP_UNITS: tuple[tuple[int, int], ...] = ((1, 1), (2, 1), (1, 2), (2, 2), (4, 1), (1, 4), (2, 4), (4, 2), (4, 4), (1, 8))  # (WM, WN)
 _WARP_REGS: tuple[tuple[int, int], ...] = ((1, 1), (2, 2), (1, 4), (4, 1), (2, 4), (4, 2), (4, 4), (4, 8))  # (FM, FN)
-_WARP_BK: tuple[int, ...] = (1, 2, 4)
+_WARP_BK: tuple[int, ...] = (1, 2, 4, 8)
 
 
 def warp_tile_moves(atom_names: tuple[str, ...]) -> list[str]:

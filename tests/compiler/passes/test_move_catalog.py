@@ -93,13 +93,13 @@ def test_schedule_leaf_set_equals_catalog():
     for r in rows:
         by_tile.setdefault(str(family_value(r, "TILE")), []).append(r)
     percell = by_tile[""]
-    assert {str(family_value(r, "REDUCE")) for r in percell} == {"None", *coop_reduce_moves()}
-    assert all(family_value(r, "STAGE") is None for r in percell), "per-cell has no operand slab to stage"
+    assert {str(family_value(r, "REDUCE")) for r in percell} == {"", *coop_reduce_moves()}
+    assert all(family_value(r, "STAGE") == "" for r in percell), "per-cell has no operand slab to stage (decided-empty)"
     tiled = by_tile["n16x8/f2x4"]
-    assert {str(family_value(r, "STAGE")) for r in tiled} == {"None", "d1/cp", "d1/tma"}, "resolved d1 stages only"
+    assert {str(family_value(r, "STAGE")) for r in tiled} == {"", "d1/cp", "d1/tma"}, "resolved d1 stages only"
     splits = {str(family_value(r, "REDUCE")) for r in tiled if family_value(r, "REDUCE")}
     assert splits == set(splitk_moves(warp=False))
-    assert all(family_value(r, "STAGE") is None for r in tiled if family_value(r, "REDUCE")), (
+    assert all(family_value(r, "STAGE") == "" for r in tiled if family_value(r, "REDUCE")), (
         "split rows are gmem-direct (030_split drops the stage)"
     )
 

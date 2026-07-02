@@ -272,11 +272,12 @@ def test_scalar_matmul_stages_through_pipeline(monkeypatch) -> None:
     register-tiled scalar matmul resolves to a single-buffer stage with the fit-to-smem ``bk_elems``
     derived; a ``sync`` pin — no contraction transport — resolves to ``None`` (gmem-direct). The
     stamped ``knobs`` codec is the RESOLVED spelling (honest variant identity): the clamped ``d1/tma``
-    for the ``d2/tma`` pin, and NOTHING when resolution declines — the row must describe the pipeline
-    the kernel actually has."""
+    for the ``d2/tma`` pin, and the explicit OFF ``""`` when resolution declines — the row must
+    describe the pipeline the kernel actually has."""
     from deplodock.compiler.ir.tile import TileOp  # noqa: PLC0415
 
     monkeypatch.setenv("DEPLODOCK_TILE", "n16x16/f2x2")
+    monkeypatch.setenv("DEPLODOCK_REDUCE", "")  # serial K: the subject is stage resolution, not the split fork
     monkeypatch.setenv("DEPLODOCK_STAGE", "d2/tma")
     out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((9, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
@@ -290,7 +291,7 @@ def test_scalar_matmul_stages_through_pipeline(monkeypatch) -> None:
     monkeypatch.setenv("DEPLODOCK_STAGE", "d1/sync")  # sync is not a contraction transport
     out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((9, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
-    assert not family_value(tile_op.knobs, "STAGE"), tile_op.knobs  # declined pin stamps nothing
+    assert family_value(tile_op.knobs, "STAGE") == "", tile_op.knobs  # declined pin stamps the OFF value
     assert tile_op.stage is None, tile_op.stage  # resolved: ineligible pin ⇒ gmem-direct
 
 
